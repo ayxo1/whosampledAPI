@@ -13,6 +13,7 @@ Run:
 
 import sys
 import time
+
 from camoufox.sync_api import Camoufox
 
 ARTIST = sys.argv[1] if len(sys.argv) > 1 else "Structure"
@@ -23,9 +24,9 @@ def main():
     print(f"Target: {URL}\n")
 
     with Camoufox(
-        headless=False,      # watch it happen, headless is scored differently by CF
-        humanize=True,       # human-like mouse movement, helps against behavioral checks
-        os="macos",          # or "windows" / "linux"
+        headless=False,  # watch it happen, headless is scored differently by CF
+        humanize=True,  # human-like mouse movement, helps against behavioral checks
+        os="macos",  # or "windows" / "linux"
     ) as browser:
         page = browser.new_page()
 

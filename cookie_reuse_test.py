@@ -17,11 +17,12 @@ Run:
 """
 
 import time
-from curl_cffi import requests as cf_requests
-from camoufox.sync_api import Camoufox
 
-ARTIST_A = "Structure"   # solved with the browser
-ARTIST_B = "Kanye-West"        # fetched with plain HTTP using the reused cookie
+from camoufox.sync_api import Camoufox
+from curl_cffi import requests as cf_requests
+
+ARTIST_A = "Structure"  # solved with the browser
+ARTIST_B = "Kanye-West"  # fetched with plain HTTP using the reused cookie
 
 BASE = "https://www.whosampled.com"
 
@@ -80,7 +81,10 @@ def solve_with_browser(artist: str):
 def fetch_with_cookies(artist: str, cookies, user_agent: str):
     """Fetch a DIFFERENT page with plain HTTP, reusing the solved cookie."""
     url = f"{BASE}/{artist}/"
-    print(f"\n[curl_cffi] fetching {url} with reused cookie + Firefox TLS impersonation, no real browser")
+    print(
+        f"\n[curl_cffi] fetching {url} with reused cookie + Firefox TLS impersonation, "
+        "no real browser"
+    )
 
     jar = {c["name"]: c["value"] for c in cookies}
     headers = {
