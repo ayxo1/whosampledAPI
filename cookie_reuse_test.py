@@ -21,7 +21,7 @@ from curl_cffi import requests as cf_requests
 from camoufox.sync_api import Camoufox
 
 ARTIST_A = "Structure"   # solved with the browser
-ARTIST_B = "2Pac"        # fetched with plain HTTP using the reused cookie
+ARTIST_B = "Kanye-West"        # fetched with plain HTTP using the reused cookie
 
 BASE = "https://www.whosampled.com"
 
