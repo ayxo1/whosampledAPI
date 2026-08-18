@@ -51,7 +51,9 @@ class SamplesResponse(BaseModel):
 
 
 class ErrorDetail(BaseModel):
-    code: Literal["artist_not_found", "upstream_invalid"]
+    code: Literal[
+        "artist_not_found", "upstream_invalid", "clearance_failed", "lookup_timeout"
+    ]
     message: str
 
 

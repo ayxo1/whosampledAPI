@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "A loopback-only API for WhoSampled Sample Uses"
 requires-python = ">=3.13"
 dependencies = [
+    "camoufox[geoip]==0.5.4",
+    "curl_cffi==0.16.0",
     "fastapi==0.116.1",
     "lxml==6.0.1",
     "pydantic==2.11.7",
@@ -29,6 +31,10 @@ packages = ["src/wsmpld"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = [
+    "live: requires visible Camoufox and live WhoSampled access",
+]
 
 [tool.ruff]
 line-length = 100

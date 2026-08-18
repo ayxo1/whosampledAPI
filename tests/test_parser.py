@@ -87,3 +87,37 @@ def test_malformed_relationship_prevents_partial_parser_results() -> None:
 
     with pytest.raises(ValueError, match="Missing required"):
         parse_samples_page(document)
+
+
+def test_live_samples_markup_is_flattened_into_sample_uses() -> None:
+    document = (FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8")
+
+    parsed = parse_samples_page(document)
+
+    assert parsed.artist_name == "Example Artist"
+    assert len(parsed.items) == 3
+    assert parsed.items[0].sampling_recording.model_dump(mode="json") == {
+        "title": "Sampling Recording",
+        "artist_credit": "Example Artist feat. Guest Artist",
+        "year": 2024,
+        "producer_credit": None,
+        "url": "https://www.whosampled.com/Example-Artist/Sampling-Recording/",
+    }
+    assert parsed.items[0].source_recording.model_dump(mode="json") == {
+        "title": "First Source",
+        "artist_credit": "Source Artist",
+        "year": 1971,
+        "url": "https://www.whosampled.com/sample/1/example-first/",
+    }
+    assert parsed.items[1].source_recording.model_dump(mode="json") == {
+        "title": "Second Source",
+        "artist_credit": "Another Artist",
+        "year": 1982,
+        "url": "https://www.whosampled.com/sample/2/example-second/",
+    }
+    assert parsed.items[2].source_recording.model_dump(mode="json") == {
+        "title": "Film Source",
+        "artist_credit": "Example Film",
+        "year": 2007,
+        "url": "https://www.whosampled.com/sample/3/example-film/",
+    }
