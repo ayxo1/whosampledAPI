@@ -12,6 +12,10 @@ class FetchSamplesPage(Protocol):
     def __call__(self, artist_slug: str) -> SamplesPage: ...
 
 
+class ArtistNotFoundError(Exception):
+    """The upstream definitively reported that the requested artist does not exist."""
+
+
 def unavailable_samples_page(artist_slug: str) -> SamplesPage:
     del artist_slug
     raise RuntimeError("Live WhoSampled retrieval is not implemented yet")

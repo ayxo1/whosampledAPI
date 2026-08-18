@@ -1,11 +1,15 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Path, Query
-from pydantic import AfterValidator, HttpUrl
+from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from pydantic import AfterValidator, Field, HttpUrl, ValidationError
 
-from wsmpld.models import Artist, Pagination, SamplesResponse
+from wsmpld.models import Artist, ErrorResponse, Pagination, SamplesResponse
 from wsmpld.parser import parse_samples_page
-from wsmpld.upstream import FetchSamplesPage, unavailable_samples_page
+from wsmpld.upstream import (
+    ArtistNotFoundError,
+    FetchSamplesPage,
+    unavailable_samples_page,
+)
 
 
 def _validate_artist_slug(value: str) -> str:
@@ -36,6 +40,16 @@ def get_samples_page() -> FetchSamplesPage:
     return unavailable_samples_page
 
 
+def _upstream_invalid() -> HTTPException:
+    return HTTPException(
+        status_code=502,
+        detail={
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        },
+    )
+
+
 app = FastAPI(
     title="WhoSampled Samples API",
     description="A local API for Sample Uses attributed to a requested artist.",
@@ -45,29 +59,47 @@ app = FastAPI(
 @app.get(
     "/artists/{artist_slug:path}/samples",
     response_model=SamplesResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "Artist was not found."},
+        502: {"model": ErrorResponse, "description": "WhoSampled response was invalid."},
+    },
     summary="Get an artist's Samples",
 )
 def read_samples(
     artist_slug: ArtistSlug,
     fetch_samples_page: Annotated[FetchSamplesPage, Depends(get_samples_page)],
     limit: Annotated[
-        int,
-        Query(gt=0, description="Maximum Sample Uses to return from source page 1."),
+        Annotated[int, Field(gt=0)] | Literal["max"],
+        Query(description="Maximum Sample Uses to return from source page 1, or 'max'."),
     ] = 1,
 ) -> SamplesResponse:
-    page = fetch_samples_page(artist_slug)
-    parsed = parse_samples_page(page.html)
-    items = parsed.items[:limit]
-    return SamplesResponse(
-        artist=Artist(
-            requested_slug=artist_slug,
-            name=parsed.artist_name,
-            samples_url=HttpUrl(page.resolved_url),
-        ),
-        items=items,
-        pagination=Pagination(
-            source_page=1,
-            returned=len(items),
-            has_more=len(parsed.items) > len(items),
-        ),
-    )
+    try:
+        page = fetch_samples_page(artist_slug)
+    except ArtistNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "artist_not_found", "message": "Artist was not found."},
+        ) from error
+    except Exception as error:
+        raise _upstream_invalid() from error
+    try:
+        parsed = parse_samples_page(page.html)
+    except ValueError as error:
+        raise _upstream_invalid() from error
+    items = parsed.items if limit == "max" else parsed.items[:limit]
+    try:
+        return SamplesResponse(
+            artist=Artist(
+                requested_slug=artist_slug,
+                name=parsed.artist_name,
+                samples_url=HttpUrl(page.resolved_url),
+            ),
+            items=items,
+            pagination=Pagination(
+                source_page=1,
+                returned=len(items),
+                has_more=len(parsed.items) > len(items),
+            ),
+        )
+    except ValidationError as error:
+        raise _upstream_invalid() from error

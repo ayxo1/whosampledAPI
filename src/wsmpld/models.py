@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, HttpUrl
 
@@ -48,3 +48,12 @@ class SamplesResponse(BaseModel):
     artist: Artist
     items: list[SampleUse]
     pagination: Pagination
+
+
+class ErrorDetail(BaseModel):
+    code: Literal["artist_not_found", "upstream_invalid"]
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    detail: ErrorDetail

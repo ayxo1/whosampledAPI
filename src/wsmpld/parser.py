@@ -88,11 +88,21 @@ def parse_samples_page(document: str) -> ParsedSamplesPage:
     if not artist_name:
         raise ValueError("Missing artist name")
 
-    items: list[SampleUse] = []
-    for relationship in _elements(
+    relationships = _elements(
         main[0],
         ".//article[contains(concat(' ', normalize-space(@class), ' '), ' sample-use ')]",
-    ):
+    )
+    empty_markers = _elements(
+        main[0],
+        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' no-sample-uses ')]",
+    )
+    if not relationships and len(empty_markers) != 1:
+        raise ValueError("Unrecognized Samples collection")
+    if relationships and empty_markers:
+        raise ValueError("Unrecognized Samples collection")
+
+    items: list[SampleUse] = []
+    for relationship in relationships:
         sampling = _elements(
             relationship,
             ".//section[contains(concat(' ', normalize-space(@class), ' '), "
@@ -102,11 +112,10 @@ def parse_samples_page(document: str) -> ParsedSamplesPage:
             relationship,
             ".//section[contains(concat(' ', normalize-space(@class), ' '), ' source-recording ')]",
         )
-        if len(sampling) != 1 or len(source) != 1:
+        if len(sampling) != 1 or not source:
             raise ValueError("Malformed Sample Use")
 
         sampling_recording = _recording(sampling[0])
-        source_recording = _recording(source[0])
         producer = _optional_text(
             sampling[0],
             ".//*[contains(concat(' ', normalize-space(@class), ' '), ' producer-credit ')]",
@@ -114,22 +123,24 @@ def parse_samples_page(document: str) -> ParsedSamplesPage:
         if producer is not None and producer.lower().startswith("produced by "):
             producer = producer[len("produced by ") :]
 
-        items.append(
-            SampleUse(
-                sampling_recording=SamplingRecording(
-                    title=sampling_recording.title,
-                    artist_credit=sampling_recording.artist_credit,
-                    year=sampling_recording.year,
-                    producer_credit=producer,
-                    url=sampling_recording.url,
-                ),
-                source_recording=SourceRecording(
-                    title=source_recording.title,
-                    artist_credit=source_recording.artist_credit,
-                    year=source_recording.year,
-                    url=source_recording.url,
-                ),
+        for source_element in source:
+            source_recording = _recording(source_element)
+            items.append(
+                SampleUse(
+                    sampling_recording=SamplingRecording(
+                        title=sampling_recording.title,
+                        artist_credit=sampling_recording.artist_credit,
+                        year=sampling_recording.year,
+                        producer_credit=producer,
+                        url=sampling_recording.url,
+                    ),
+                    source_recording=SourceRecording(
+                        title=source_recording.title,
+                        artist_credit=source_recording.artist_credit,
+                        year=source_recording.year,
+                        url=source_recording.url,
+                    ),
+                )
             )
-        )
 
     return ParsedSamplesPage(artist_name=artist_name, items=items)
