@@ -377,6 +377,98 @@ def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
     ]
 
 
+def test_sequential_requests_reuse_unexpired_clearance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": "do-not-log-this-secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+        responses = [
+            TestClient(app).get("/artists/Kanye-West/samples")
+            for _ in range(2)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert all(
+        response.json()["artist"]["requested_slug"] == "Kanye-West"
+        for response in responses
+    )
+    assert acquisitions == 1
+    assert fetches == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count("reusing unexpired clearance session") == 1
+    assert "do-not-log-this-secret" not in "\n".join(messages)
+    assert "do-not-log-this-secret" not in "\n".join(response.text for response in responses)
+
+
+def test_expired_clearance_is_discarded_before_next_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    current_time = 0.0
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": f"do-not-log-secret-{acquisitions}"},
+            user_agent=f"test-agent-{acquisitions}",
+            expires_at=current_time + 10.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: current_time,
+    )
+
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+        first_response = TestClient(app).get("/artists/Kanye-West/samples")
+        current_time = 10.0
+        second_response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert [first_response.status_code, second_response.status_code] == [200, 200]
+    assert acquisitions == 2
+    assert fetches == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count("discarding expired clearance session") == 1
+    assert "do-not-log-secret" not in "\n".join(messages)
+    assert "do-not-log-secret" not in first_response.text + second_response.text
+
+
 def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries() -> None:
     acquisitions = 0
     fetches = 0

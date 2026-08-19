@@ -65,6 +65,7 @@ class CamoufoxClearanceAcquirer:
         from camoufox.sync_api import Camoufox
         from playwright.sync_api import Error as PlaywrightError
 
+        logger.info("visible unattended Camoufox clearance acquisition started")
         deadline = monotonic() + timeout
         with Camoufox(  # type: ignore[no-untyped-call]
             headless=False,
@@ -130,6 +131,7 @@ class CurlCffiBrowserlessFetcher:
     def __call__(
         self, url: str, clearance: ClearanceSession, timeout: float
     ) -> BrowserlessResponse:
+        logger.info("Samples data fetch started transport=curl_cffi")
         if self._session is None:
             from curl_cffi import requests
 
@@ -173,9 +175,16 @@ class BrowserlessSamplesPage:
             raise LookupTimeoutError("Timed out waiting for upstream session")
         try:
             clearance = self._clearance
-            if clearance is None or clearance.expires_at <= self._monotonic():
+            if clearance is None:
                 clearance = self._acquire(deadline)
                 self._clearance = clearance
+            elif clearance.expires_at <= self._monotonic():
+                logger.info("discarding expired clearance session")
+                self._clearance = None
+                clearance = self._acquire(deadline)
+                self._clearance = clearance
+            else:
+                logger.info("reusing unexpired clearance session")
             url = f"{BASE_URL}/{quote(artist_slug, safe='')}/samples/"
             response = self._fetch(url, clearance, deadline)
             if _is_challenge(response):

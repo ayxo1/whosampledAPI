@@ -62,18 +62,24 @@ def _uvicorn_server(port: int) -> Iterator[subprocess.Popen[str]]:
 @pytest.mark.live
 def test_two_live_kanye_west_requests_reuse_browser_clearance() -> None:
     port = _free_loopback_port()
+    responses: list[httpx.Response] = []
+    request_error: httpx.HTTPError | None = None
 
     with _uvicorn_server(port) as process:
-        responses = [
-            httpx.get(
-                f"http://127.0.0.1:{port}/artists/Kanye-West/samples",
-                timeout=125,
-            )
-            for _ in range(2)
-        ]
+        try:
+            responses = [
+                httpx.get(
+                    f"http://127.0.0.1:{port}/artists/Kanye-West/samples",
+                    timeout=125,
+                )
+                for _ in range(2)
+            ]
+        except httpx.HTTPError as error:
+            request_error = error
 
     assert process.stdout is not None
     logs = process.stdout.read()
+    assert request_error is None, [repr(request_error), logs]
     if [response.status_code for response in responses] != [200, 200]:
         print(logs)
     assert [response.status_code for response in responses] == [200, 200], [
@@ -85,6 +91,8 @@ def test_two_live_kanye_west_requests_reuse_browser_clearance() -> None:
     assert all(result.artist.name == "Kanye West" for result in parsed)
     assert all(result.items for result in parsed)
 
-    assert logs.count("clearance acquisition started") == 1
+    assert logs.count("visible unattended Camoufox clearance acquisition started") == 1
+    assert logs.count("reusing unexpired clearance session") == 1
     assert logs.count("browserless Samples fetch started") == 2
-    assert "browser sample-data fetch" not in logs
+    assert logs.count("Samples data fetch started transport=curl_cffi") == 2
+    assert logs.count("Samples data fetch started") == 2
