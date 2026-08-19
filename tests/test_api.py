@@ -186,6 +186,75 @@ def test_user_can_request_every_sample_use_on_the_current_page() -> None:
     }
 
 
+def test_2pac_samples_use_page_artist_when_live_track_credit_is_implicit() -> None:
+    page = SamplesPage(
+        html=(FIXTURES / "live_implicit_artist_credit.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/2Pac/samples/",
+    )
+    with _override_samples_page(lambda artist_slug: page):
+        response = TestClient(app).get("/artists/2Pac/samples?limit=max")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "artist": {
+            "requested_slug": "2Pac",
+            "name": "2Pac",
+            "samples_url": "https://www.whosampled.com/2Pac/samples/",
+        },
+        "items": [
+            {
+                "sampling_recording": {
+                    "title": "Example Track",
+                    "artist_credit": "2Pac",
+                    "year": 1996,
+                    "producer_credit": None,
+                    "url": "https://www.whosampled.com/2Pac/Example-Track/",
+                },
+                "source_recording": {
+                    "title": "Example Source",
+                    "artist_credit": "Source Artist",
+                    "year": 1985,
+                    "url": "https://www.whosampled.com/sample/8/example-source/",
+                },
+            }
+        ],
+        "pagination": {"source_page": 1, "returned": 1, "has_more": False},
+    }
+
+
+def test_live_track_explicit_artist_credit_remains_unchanged() -> None:
+    page = SamplesPage(
+        html=(FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Example-Artist/samples/",
+    )
+    with _override_samples_page(lambda artist_slug: page):
+        response = TestClient(app).get("/artists/Example-Artist/samples?limit=max")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["sampling_recording"]["artist_credit"] == (
+        "Example Artist feat. Guest Artist"
+    )
+
+
+def test_incomplete_implicit_credit_sample_use_still_fails_closed() -> None:
+    document = (FIXTURES / "live_implicit_artist_credit.html").read_text(encoding="utf-8")
+    document = document.replace('class="connectionName"', 'class="unknown-connection"')
+    page = SamplesPage(
+        html=document,
+        resolved_url="https://www.whosampled.com/2Pac/samples/",
+    )
+    with _override_samples_page(lambda artist_slug: page):
+        response = TestClient(app).get("/artists/2Pac/samples?limit=max")
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": {
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        }
+    }
+
+
 def test_positive_numeric_limit_applies_to_current_page_sample_uses() -> None:
     page = SamplesPage(
         html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),

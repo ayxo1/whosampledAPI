@@ -120,12 +120,15 @@ def _live_samples_page(root: html.HtmlElement) -> ParsedSamplesPage:
         sampling_href = title_links[0].get("href")
         if sampling_href is None:
             raise ValueError("Missing required recording URL")
-        sampling_credit = " ".join(
-            _text(track, f".//*[{_xpath_has_class('trackArtistName')}]").split()
-        )
-        if not sampling_credit.startswith("by "):
-            raise ValueError("Malformed Sampling Recording artist credit")
-        sampling_credit = sampling_credit.removeprefix("by ")
+        credit_selector = f".//*[{_xpath_has_class('trackArtistName')}]"
+        credit_elements = _elements(track, credit_selector)
+        if credit_elements:
+            sampling_credit = " ".join(_text(track, credit_selector).split())
+            if not sampling_credit.startswith("by "):
+                raise ValueError("Malformed Sampling Recording artist credit")
+            sampling_credit = sampling_credit.removeprefix("by ")
+        else:
+            sampling_credit = artist_name
         sampling_year = _live_year(track, f".//*[{_xpath_has_class('trackYear')}]")
         producer = _optional_text(track, ".//*[contains(@class, 'producer')]")
         if producer is not None and producer.lower().startswith("produced by "):
