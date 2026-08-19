@@ -319,11 +319,13 @@ def test_clearance_failure_has_stable_service_unavailable_response() -> None:
     }
 
 
-def test_complete_lookup_timeout_has_stable_gateway_timeout_response() -> None:
+def test_complete_lookup_timeout_has_stable_gateway_timeout_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     def timed_out_lookup(artist_slug: str) -> SamplesPage:
         raise LookupTimeoutError(artist_slug)
 
-    with _override_samples_page(timed_out_lookup):
+    with caplog.at_level("INFO"), _override_samples_page(timed_out_lookup):
         response = TestClient(app, raise_server_exceptions=False).get(
             "/artists/Kanye-West/samples"
         )
@@ -335,6 +337,9 @@ def test_complete_lookup_timeout_has_stable_gateway_timeout_response() -> None:
             "message": "The lookup exceeded its 120-second time limit.",
         }
     }
+    assert "Samples lookup timed out artist_slug=Kanye-West" in [
+        record.getMessage() for record in caplog.records
+    ]
 
 
 def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
@@ -469,7 +474,9 @@ def test_expired_clearance_is_discarded_before_next_request(
     assert "do-not-log-secret" not in first_response.text + second_response.text
 
 
-def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries() -> None:
+def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     acquisitions = 0
     fetches = 0
     page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
@@ -502,12 +509,15 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries() -> 
         monotonic=lambda: 0.0,
     )
 
-    with _override_samples_page(fetch_samples_page):
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
         response = TestClient(app).get("/artists/Kanye-West/samples")
 
     assert response.status_code == 200
     assert acquisitions == 2
     assert fetches == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count("browserless Samples fetch challenged; refreshing clearance") == 1
+    assert "secret-" not in "\n".join(messages)
 
 
 def test_second_browserless_challenge_fails_without_browser_fallback() -> None:

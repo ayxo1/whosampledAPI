@@ -106,6 +106,7 @@ def read_samples(
     except ClearanceFailedError as error:
         raise HTTPException(status_code=503, detail=CLEARANCE_FAILED_DETAIL) from error
     except LookupTimeoutError as error:
+        logger.info("Samples lookup timed out artist_slug=%s", artist_slug)
         raise HTTPException(status_code=504, detail=LOOKUP_TIMEOUT_DETAIL) from error
     except Exception as error:
         logger.warning("Samples fetch failed error_type=%s", type(error).__name__)
