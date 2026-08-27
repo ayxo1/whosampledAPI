@@ -1,0 +1,7 @@
+# Use opaque cursors for Samples pagination
+
+Clients traverse a requested artist's Samples collection through an opaque continuation cursor rather than source page numbers or one eager full-collection request. The versioned, URL-safe cursor carries a validated artist and internal source position without server-side cursor storage; it is opaque by contract but is not a security boundary. Each API call fetches at most one upstream page, preserves the item-based `limit`, and may use the cursor to resume within that page. Callers may change the limit while continuing. Responses expose a nullable `next_cursor`, `returned`, and `has_more`, but no source page number.
+
+A cursor traverses the source site's live collection without a snapshot guarantee or time-based expiry. The API issues a cursor for another source page only from a validated next-page link for the same artist Samples collection; it does not infer or probe for another page. This keeps the source site's pagination scheme out of the public contract, reduces long request bursts, and avoids holding the serialized upstream session for an entire large collection.
+
+The API exposes no total result or page count. `has_more` is true exactly when `next_cursor` is not null. If live source changes leave a previously issued cursor offset beyond the re-fetched page, the API returns `409 Conflict` with a `collection_changed` error instead of silently ending the traversal.

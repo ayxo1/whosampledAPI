@@ -5,7 +5,7 @@ This context describes recorded-music sampling relationships returned by the loc
 ## Language
 
 **Samples**:
-The public API collection of Sample Uses attributed to a requested artist. The plural term mirrors the source site's public route; each relationship in the collection is a Sample Use.
+The public API collection of Sample Uses attributed to a requested artist and exposed across the source site's numbered artist Samples pages. Relationships that require per-recording expansion are outside this collection.
 _Avoid_: Sample lookup, sample result
 
 **Sample Use**:
