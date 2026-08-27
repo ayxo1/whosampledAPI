@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from threading import Lock
 from time import monotonic, time
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 
 BASE_URL = "https://www.whosampled.com"
 CLEARANCE_TIMEOUT_SECONDS = 90.0
@@ -18,6 +18,15 @@ logger = logging.getLogger("uvicorn.error")
 class SamplesPage:
     html: str
     resolved_url: str
+
+
+@dataclass(frozen=True)
+class SamplesPageLocation:
+    page_number: int
+
+    def __post_init__(self) -> None:
+        if type(self.page_number) is not int or self.page_number < 2:
+            raise ValueError("Samples continuation page must be an integer greater than one")
 
 
 @dataclass(frozen=True)
@@ -35,7 +44,11 @@ class BrowserlessResponse:
 
 
 class FetchSamplesPage(Protocol):
-    def __call__(self, artist_slug: str) -> SamplesPage: ...
+    def __call__(
+        self,
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage: ...
 
 
 class ArtistNotFoundError(Exception):
@@ -168,7 +181,13 @@ class BrowserlessSamplesPage:
         self._clearance: ClearanceSession | None = None
         self._lock = Lock()
 
-    def __call__(self, artist_slug: str) -> SamplesPage:
+    def __call__(
+        self,
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        if location is not None and not isinstance(location, SamplesPageLocation):
+            raise TypeError("location must be an internal Samples page location")
         deadline = self._monotonic() + LOOKUP_TIMEOUT_SECONDS
         acquired_lock = self._lock.acquire(timeout=self._remaining(deadline))
         if not acquired_lock:
@@ -186,13 +205,26 @@ class BrowserlessSamplesPage:
             else:
                 logger.info("reusing unexpired clearance session")
             url = f"{BASE_URL}/{quote(artist_slug, safe='')}/samples/"
-            response = self._fetch(url, clearance, deadline)
+            if location is not None:
+                url = f"{url}?sp={location.page_number}"
+            requested_page = location.page_number if location is not None else 1
+
+            def fetch_validated(current_clearance: ClearanceSession) -> BrowserlessResponse:
+                fetched = self._fetch(url, current_clearance, deadline)
+                _validate_resolved_samples_url(
+                    fetched.resolved_url,
+                    artist_slug=artist_slug,
+                    requested_page=requested_page,
+                )
+                return fetched
+
+            response = fetch_validated(clearance)
             if _is_challenge(response):
                 logger.info("browserless Samples fetch challenged; refreshing clearance")
                 self._clearance = None
                 clearance = self._acquire(deadline)
                 self._clearance = clearance
-                response = self._fetch(url, clearance, deadline)
+                response = fetch_validated(clearance)
                 if _is_challenge(response):
                     self._clearance = None
                     raise ClearanceFailedError("Browserless retry was challenged")
@@ -249,6 +281,47 @@ class BrowserlessSamplesPage:
 def _is_challenge(response: BrowserlessResponse) -> bool:
     normalized = response.text.lower()
     return "<title>just a moment" in normalized or "cf-challenge" in normalized
+
+
+def _validate_resolved_samples_url(
+    resolved_url: str,
+    *,
+    artist_slug: str,
+    requested_page: int,
+) -> None:
+    try:
+        parsed = urlsplit(resolved_url)
+        port = parsed.port
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as error:
+        raise RuntimeError("Malformed Samples redirect destination") from error
+
+    expected_path = f"/{quote(artist_slug, safe='')}/samples/"
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "www.whosampled.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path != expected_path
+        or parsed.fragment
+    ):
+        raise RuntimeError("Unsafe Samples redirect destination")
+
+    if not query:
+        resolved_page = 1
+    elif len(query) == 1 and query[0][0] == "sp":
+        page_value = query[0][1]
+        if not page_value.isascii() or not page_value.isdecimal():
+            raise RuntimeError("Malformed Samples redirect page")
+        resolved_page = int(page_value)
+        if resolved_page < 2 or str(resolved_page) != page_value:
+            raise RuntimeError("Malformed Samples redirect page")
+    else:
+        raise RuntimeError("Malformed Samples redirect query")
+
+    if resolved_page < requested_page:
+        raise RuntimeError("Samples redirect moved backward")
 
 
 live_samples_page = BrowserlessSamplesPage(

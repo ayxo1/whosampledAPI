@@ -7,6 +7,7 @@ from threading import Event, Lock
 from urllib.parse import quote
 
 import pytest
+from curl_cffi.requests.exceptions import TooManyRedirects
 from fastapi.testclient import TestClient
 
 from wsmpld.api import app, get_samples_page
@@ -16,9 +17,11 @@ from wsmpld.upstream import (
     BrowserlessSamplesPage,
     ClearanceFailedError,
     ClearanceSession,
+    FetchBrowserlessly,
     FetchSamplesPage,
     LookupTimeoutError,
     SamplesPage,
+    SamplesPageLocation,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -31,6 +34,30 @@ def _override_samples_page(fetch_samples_page: FetchSamplesPage) -> Iterator[Non
         yield
     finally:
         app.dependency_overrides.clear()
+
+
+def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSamplesPage:
+    return BrowserlessSamplesPage(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+
+def _at_samples_page(
+    page_fetch: BrowserlessSamplesPage,
+    page_number: int,
+) -> FetchSamplesPage:
+    location = SamplesPageLocation(page_number=page_number)
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        return page_fetch(artist_slug, location)
+
+    return fetch
 
 
 def test_user_receives_one_sample_use_by_default() -> None:
@@ -67,6 +94,206 @@ def test_user_receives_one_sample_use_by_default() -> None:
         ],
         "pagination": {"source_page": 1, "returned": 1, "has_more": False},
     }
+
+
+def test_internal_continuation_location_fetches_later_samples_page() -> None:
+    requested_urls: list[str] = []
+    page_html = (FIXTURES / "live_samples_middle_page.html").read_text(encoding="utf-8")
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        requested_urls.append(url)
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    page_fetch = _browserless_page(fetch_browserlessly)
+
+    with _override_samples_page(_at_samples_page(page_fetch, 40)):
+        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+
+    assert response.status_code == 200
+    assert requested_urls == ["https://www.whosampled.com/Kanye-West/samples/?sp=40"]
+    assert response.json()["artist"]["samples_url"] == requested_urls[0]
+    assert response.json()["items"][0]["sampling_recording"]["title"] == (
+        "Fight With the Best"
+    )
+
+
+@pytest.mark.parametrize("page_number", [True, 0, 1, -1])
+def test_internal_continuation_location_rejects_impossible_pages(
+    page_number: int,
+) -> None:
+    with pytest.raises(ValueError, match="greater than one"):
+        SamplesPageLocation(page_number=page_number)
+
+
+def test_page_fetch_boundary_rejects_arbitrary_url_before_upstream_work() -> None:
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        raise AssertionError("clearance must not run for an arbitrary location")
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        raise AssertionError("fetch must not run for an arbitrary location")
+
+    page_fetch = BrowserlessSamplesPage(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(TypeError, match="internal Samples page location"):
+        page_fetch(  # type: ignore[arg-type]
+            "Kanye-West",
+            "https://evil.example/Kanye-West/samples/?sp=40",
+        )
+
+    assert acquisitions == 0
+    assert fetches == 0
+
+
+@pytest.mark.parametrize(
+    "resolved_url",
+    [
+        "http://www.whosampled.com/Kanye-West/samples/?sp=40",
+        "https://evil.example/Kanye-West/samples/?sp=40",
+        "https://www.whosampled.com/Jay-Z/samples/?sp=40",
+        "https://www.whosampled.com/Kanye-West/?sp=40",
+        "https://www.whosampled.com/Kanye-West/samples/?sp=39",
+        "https://www.whosampled.com/Kanye-West/samples/?sp=forty",
+        "https://www.whosampled.com/Kanye-West/samples/?sp=40&sp=41",
+        "https://www.whosampled.com/Kanye-West/samples/?sp=40#again",
+    ],
+)
+def test_unexpected_continuation_redirect_has_stable_bad_gateway_response(
+    resolved_url: str,
+) -> None:
+    page_html = (FIXTURES / "live_samples_middle_page.html").read_text(encoding="utf-8")
+    page_fetch = _browserless_page(
+        lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=200,
+            text=page_html,
+            resolved_url=resolved_url,
+        )
+    )
+
+    with _override_samples_page(_at_samples_page(page_fetch, 40)):
+        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": {
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        }
+    }
+
+
+def test_forward_redirect_within_artist_samples_collection_is_accepted() -> None:
+    page_html = (FIXTURES / "live_samples_middle_page.html").read_text(encoding="utf-8")
+    page_fetch = _browserless_page(
+        lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=200,
+            text=page_html,
+            resolved_url="https://www.whosampled.com/Kanye-West/samples/?sp=41",
+        )
+    )
+
+    with _override_samples_page(_at_samples_page(page_fetch, 40)):
+        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+
+    assert response.status_code == 200
+    assert response.json()["artist"]["samples_url"] == (
+        "https://www.whosampled.com/Kanye-West/samples/?sp=41"
+    )
+
+
+def test_initial_page_redirect_to_another_artist_has_stable_bad_gateway_response() -> None:
+    page_html = (FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8")
+    page_fetch = _browserless_page(
+        lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=200,
+            text=page_html,
+            resolved_url="https://www.whosampled.com/Jay-Z/samples/",
+        )
+    )
+
+    with _override_samples_page(page_fetch):
+        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_invalid"
+
+
+def test_browserless_redirect_loop_has_stable_bad_gateway_response() -> None:
+    def redirect_loop(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        raise TooManyRedirects("Too many redirects")
+
+    page_fetch = _browserless_page(redirect_loop)
+
+    with _override_samples_page(page_fetch):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_invalid"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "response_html"),
+    [
+        (404, "artist not found"),
+        (403, "<title>Just a moment...</title>"),
+    ],
+)
+def test_unsafe_destination_is_rejected_before_status_or_challenge_mapping(
+    status_code: int,
+    response_html: str,
+) -> None:
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=status_code,
+            text=response_html,
+            resolved_url="https://evil.example/Kanye-West/samples/",
+        )
+
+    page_fetch = BrowserlessSamplesPage(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+    with _override_samples_page(page_fetch):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_invalid"
+    assert acquisitions == 1
+    assert fetches == 1
 
 
 def test_unsafe_artist_slugs_receive_normal_validation_errors() -> None:
