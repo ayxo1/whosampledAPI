@@ -121,3 +121,23 @@ def test_live_samples_markup_is_flattened_into_sample_uses() -> None:
         "year": 2007,
         "url": "https://www.whosampled.com/sample/3/example-film/",
     }
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "sampling_title"),
+    [
+        ("live_samples_first_page.html", "Bound 2"),
+        ("live_samples_middle_page.html", "Fight With the Best"),
+        ("live_samples_final_page.html", "Forever La Vida"),
+    ],
+)
+def test_sanitized_live_pagination_pages_remain_parseable(
+    fixture_name: str,
+    sampling_title: str,
+) -> None:
+    document = (FIXTURES / fixture_name).read_text(encoding="utf-8")
+
+    parsed = parse_samples_page(document)
+
+    assert parsed.artist_name == "Kanye West"
+    assert parsed.items[0].sampling_recording.title == sampling_title
