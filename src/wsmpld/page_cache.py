@@ -8,6 +8,7 @@ from time import monotonic
 from unicodedata import normalize
 
 from wsmpld.parser import ParsedSamplesPage, parse_samples_page
+from wsmpld.samples_url import resolved_samples_page_number
 from wsmpld.upstream import FetchSamplesPage, SamplesPage, SamplesPageLocation
 
 logger = logging.getLogger("uvicorn.error")
@@ -87,7 +88,15 @@ class ParsedSamplesPageCache:
                 if location is None
                 else fetch_samples_page(artist_slug, location)
             )
-            resolved_page_number = source.page_number or page_number
+            resolved_page_number = resolved_samples_page_number(
+                source.resolved_url,
+                artist_slug,
+            )
+            if resolved_page_number < page_number or (
+                source.page_number is not None
+                and source.page_number != resolved_page_number
+            ):
+                raise ValueError("Resolved Samples page does not match its location")
             parsed = parse_samples_page(
                 source.html,
                 artist_slug=artist_slug,

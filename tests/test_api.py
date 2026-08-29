@@ -274,16 +274,11 @@ def test_concurrent_cache_misses_share_one_upstream_fetch() -> None:
         assert first_fetch_started.wait(timeout=2)
         second_response = pool.submit(request_samples)
         assert second_cache_lookup.wait(timeout=2)
-        try:
-            second_finished_before_first = second_response.result(timeout=0.2)
-        except FutureTimeoutError:
-            second_finished_before_first = None
-        finally:
-            release_first_fetch.set()
+        assert not second_response.done()
+        release_first_fetch.set()
 
         response_results = [first_response.result(timeout=2), second_response.result(timeout=2)]
 
-    assert second_finished_before_first is None
     assert fetches == 1
     assert response_results[0] == response_results[1]
 
@@ -871,17 +866,16 @@ def test_unsafe_artist_slugs_receive_normal_validation_errors() -> None:
 
 def test_valid_punctuation_and_unicode_slug_is_preserved() -> None:
     requested_slug = "Björk!$&'()+,;=@"
+    encoded_slug = quote(requested_slug, safe="")
     received_slugs: list[str] = []
     page = SamplesPage(
         html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
-        resolved_url="https://www.whosampled.com/Bjork/samples/",
+        resolved_url=f"https://www.whosampled.com/{encoded_slug}/samples/",
     )
 
     def fetch(artist_slug: str) -> SamplesPage:
         received_slugs.append(artist_slug)
         return page
-
-    encoded_slug = quote(requested_slug, safe="")
 
     with _override_samples_page(fetch):
         response = TestClient(app).get(f"/artists/{encoded_slug}/samples")
@@ -1732,15 +1726,26 @@ def test_invalid_resolved_upstream_url_has_stable_bad_gateway_response() -> None
         html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
         resolved_url="https://evil.example/Kanye-West/samples/",
     )
-    with _override_samples_page(lambda artist_slug: page):
-        response = TestClient(app, raise_server_exceptions=False).get(
-            "/artists/Kanye-West/samples"
-        )
+    fetches = 0
 
-    assert response.status_code == 502
-    assert response.json() == {
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return page
+
+    with _override_samples_page(fetch):
+        responses = [
+            TestClient(app, raise_server_exceptions=False).get(
+                "/artists/Kanye-West/samples"
+            )
+            for _ in range(2)
+        ]
+
+    assert [response.status_code for response in responses] == [502, 502]
+    assert all(response.json() == {
         "detail": {
             "code": "upstream_invalid",
             "message": "WhoSampled returned an unexpected response.",
         }
-    }
+    } for response in responses)
+    assert fetches == 2
