@@ -321,8 +321,13 @@ class BrowserlessSamplesPage:
         self, url: str, clearance: ClearanceSession, deadline: float
     ) -> BrowserlessResponse:
         self._pace(deadline)
-        logger.info("browserless Samples fetch started url=%s", url)
-        self._last_request_started_at = self._monotonic()
+        request_started_at = self._monotonic()
+        logger.info(
+            "browserless Samples fetch started url=%s started_at=%.3f",
+            url,
+            request_started_at,
+        )
+        self._last_request_started_at = request_started_at
         try:
             response = self._fetch_browserlessly(
                 url,

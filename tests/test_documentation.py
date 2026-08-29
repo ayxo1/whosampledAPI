@@ -9,9 +9,9 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert 'python -m pip install -e ".[dev]"' in readme
     assert "python -m camoufox fetch" in readme
     assert (
-        "python -m uvicorn wsmpld.api:app --host 127.0.0.1 --port 8000" in readme
+        "python -m uvicorn wsmpld.api:app --host 127.0.0.1 --port 8000 --workers 1"
+        in readme
     )
-    assert "--workers 1" in readme
     assert "http://127.0.0.1:8000/docs" in readme
     assert "pagination.next_cursor" in readme
     assert "collection_changed" in readme
@@ -22,6 +22,16 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert "upstream_rate_limited" in readme
     assert "Retry-After" in readme
     assert "Cache hits do not wait" in readme
+    assert "restart without a cursor" in readme
+    assert "restart the traversal" in readme
+    assert "400 invalid_cursor" in readme
+    assert "503 upstream_rate_limited" in readme
+    assert "while ($true)" in readme
+    assert "$null -ne $cursor" in readme
+    assert '$page = Invoke-RestMethod "$base`?$query"' in readme
+    assert "$cursor = $page.pagination.next_cursor" in readme
+    assert "if ($null -eq $cursor) { break }" in readme
+    assert '$limit = "max"' in readme
     assert "python -m pytest" in readme
     assert 'python -m pytest -m live tests/test_live_samples.py -q' in readme
     assert "python -m ruff check ." in readme

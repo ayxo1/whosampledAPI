@@ -31,22 +31,33 @@ the local machine. Open http://127.0.0.1:8000/docs for the generated interactive
 or start a Samples traversal directly:
 
 ```powershell
-$page = Invoke-RestMethod "http://127.0.0.1:8000/artists/Kanye-West/samples?limit=5"
-$page.items
-$cursor = [uri]::EscapeDataString($page.pagination.next_cursor)
-$nextPage = Invoke-RestMethod "http://127.0.0.1:8000/artists/Kanye-West/samples?cursor=$cursor&limit=max"
+$base = "http://127.0.0.1:8000/artists/Kanye-West/samples"
+$cursor = $null
+$limit = 5
+while ($true) {
+    $query = "limit=$limit"
+    if ($null -ne $cursor) {
+        $query += "&cursor=" + [uri]::EscapeDataString($cursor)
+    }
+    $page = Invoke-RestMethod "$base`?$query"
+    $page.items
+    $cursor = $page.pagination.next_cursor
+    if ($null -eq $cursor) { break }
+    $limit = "max"
+}
 ```
 
 Omit `cursor` for the first request. A numeric limit can stop within the current WhoSampled page,
 while `limit=max` returns the rest of that page. Continue with `pagination.next_cursor` until it is
 null. Each request fetches at most one upstream page, and clients may change the limit between
-requests.
+requests. A `400 invalid_cursor` response means the cursor is malformed or belongs to another
+artist; restart without a cursor. A `409 collection_changed` response means a live page changed
+after the cursor was issued; restart the traversal. A `503 upstream_rate_limited` response means
+WhoSampled rejected the request; wait for the validated `Retry-After` header when present.
 
-The cursor traverses a live collection and does not create a snapshot or expire with time. If
-WhoSampled changes a page so a saved position is no longer valid, the API returns
-`409 collection_changed`; restart without a cursor. Treat cursors as opaque values and do not
-construct or edit them. Changes that keep a saved position valid cannot be detected, so live
-reorderings may cause duplicates or omissions across requests.
+The cursor traverses a live collection and does not create a snapshot or expire with time. Treat
+cursors as opaque values and do not construct or edit them. Changes that keep a saved position
+valid cannot be detected, so live reorderings may cause duplicates or omissions across requests.
 
 The first accepted lookup can open visible Camoufox for up to 90 seconds. A complete lookup has
 a 120-second deadline. Later requests reuse unexpired clearance, and all upstream WhoSampled

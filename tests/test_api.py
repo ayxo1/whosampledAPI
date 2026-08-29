@@ -155,6 +155,16 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
     assert "Samples request pacing wait_seconds=4.250" in [
         record.getMessage() for record in caplog.records
     ]
+    assert [
+        message
+        for message in (record.getMessage() for record in caplog.records)
+        if "browserless Samples fetch started" in message
+    ] == [
+        "browserless Samples fetch started "
+        "url=https://www.whosampled.com/Kanye-West/samples/ started_at=0.000",
+        "browserless Samples fetch started "
+        "url=https://www.whosampled.com/Jay-Z/samples/ started_at=4.250",
+    ]
 
 
 def test_cache_hit_returns_without_pacing_or_an_upstream_request(
