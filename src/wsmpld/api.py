@@ -15,6 +15,7 @@ from wsmpld.upstream import (
     FetchSamplesPage,
     LookupTimeoutError,
     SamplesPageLocation,
+    UpstreamRateLimitedError,
     live_samples_page,
 )
 
@@ -43,6 +44,10 @@ INVALID_CURSOR_DETAIL = {
 COLLECTION_CHANGED_DETAIL = {
     "code": "collection_changed",
     "message": "The live Samples collection changed; restart the traversal.",
+}
+UPSTREAM_RATE_LIMITED_DETAIL = {
+    "code": "upstream_rate_limited",
+    "message": "WhoSampled rate limited the request.",
 }
 
 
@@ -93,6 +98,35 @@ def _documented_error(description: str, detail: dict[str, str]) -> dict[str, obj
     }
 
 
+def _documented_service_unavailable() -> dict[str, object]:
+    return {
+        "model": ErrorResponse,
+        "description": "Upstream clearance failed or WhoSampled rate limited the request.",
+        "headers": {
+            "Retry-After": {
+                "description": (
+                    "Validated delay or HTTP date supplied by WhoSampled after a rate limit."
+                ),
+                "schema": {"type": "string"},
+            }
+        },
+        "content": {
+            "application/json": {
+                "examples": {
+                    "clearance_failed": {
+                        "summary": "Clearance acquisition failed",
+                        "value": {"detail": CLEARANCE_FAILED_DETAIL},
+                    },
+                    "upstream_rate_limited": {
+                        "summary": "WhoSampled rate limited the request",
+                        "value": {"detail": UPSTREAM_RATE_LIMITED_DETAIL},
+                    },
+                }
+            }
+        },
+    }
+
+
 def _samples_collection_url(resolved_url: str) -> HttpUrl:
     parsed = urlsplit(resolved_url)
     return HttpUrl(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
@@ -114,7 +148,7 @@ app = FastAPI(
             "The live Samples collection changed.", COLLECTION_CHANGED_DETAIL
         ),
         502: _documented_error("WhoSampled response was invalid.", UPSTREAM_INVALID_DETAIL),
-        503: _documented_error("Upstream clearance failed.", CLEARANCE_FAILED_DETAIL),
+        503: _documented_service_unavailable(),
         504: _documented_error("Complete lookup timed out.", LOOKUP_TIMEOUT_DETAIL),
     },
     summary="Get an artist's Samples",
@@ -165,6 +199,19 @@ def read_samples(
         raise HTTPException(status_code=404, detail=ARTIST_NOT_FOUND_DETAIL) from error
     except ClearanceFailedError as error:
         raise HTTPException(status_code=503, detail=CLEARANCE_FAILED_DETAIL) from error
+    except UpstreamRateLimitedError as error:
+        logger.info(
+            "Samples lookup failed code=upstream_rate_limited "
+            "retry_after_forwarded=%s artist_slug=%s",
+            error.retry_after is not None,
+            artist_slug,
+        )
+        headers = {"Retry-After": error.retry_after} if error.retry_after is not None else None
+        raise HTTPException(
+            status_code=503,
+            detail=UPSTREAM_RATE_LIMITED_DETAIL,
+            headers=headers,
+        ) from error
     except LookupTimeoutError as error:
         logger.info("Samples lookup timed out artist_slug=%s", artist_slug)
         raise HTTPException(status_code=504, detail=LOOKUP_TIMEOUT_DETAIL) from error

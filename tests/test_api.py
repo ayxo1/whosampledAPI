@@ -61,6 +61,10 @@ def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSam
         ),
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
     )
 
 
@@ -98,6 +102,228 @@ def test_user_receives_one_sample_use_by_default() -> None:
         ],
         "pagination": {"next_cursor": None, "returned": 1, "has_more": False},
     }
+
+
+def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    current_time = 0.0
+    fetch_times: list[float] = []
+    sleeps: list[float] = []
+    jitter_bounds: list[tuple[float, float]] = []
+
+    def monotonic() -> float:
+        return current_time
+
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
+    def jitter(lower: float, upper: float) -> float:
+        jitter_bounds.append((lower, upper))
+        return 0.25
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        fetch_times.append(current_time)
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=monotonic,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+    client = TestClient(app)
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+        first_response = client.get("/artists/Kanye-West/samples")
+        second_response = client.get("/artists/Jay-Z/samples")
+
+    assert [first_response.status_code, second_response.status_code] == [200, 200]
+    assert fetch_times == [0.0, 4.25]
+    assert sleeps == [4.25]
+    assert jitter_bounds == [(0.0, 1.0)]
+    assert "Samples request pacing wait_seconds=4.250" in [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+def test_cache_hit_returns_without_pacing_or_an_upstream_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    page_html = (FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8")
+    fetches = 0
+    sleeps = 0
+    jitter_calls = 0
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    def sleep(delay: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    def jitter(lower: float, upper: float) -> float:
+        nonlocal jitter_calls
+        jitter_calls += 1
+        return 0.0
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+    client = TestClient(app)
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        cached_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+
+    assert [first_response.status_code, cached_response.status_code] == [200, 200]
+    assert fetches == 1
+    assert sleeps == 0
+    assert jitter_calls == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Samples page cache miss" in message for message in messages)
+    assert any("Samples page cache hit" in message for message in messages)
+    assert not any("Samples request pacing" in message for message in messages)
+
+
+def test_upstream_rate_limit_returns_stable_service_unavailable_without_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=429,
+            text="do-not-log-upstream-body",
+            resolved_url=url,
+            headers={"Retry-After": "120", "X-Secret": "do-not-log-header"},
+        )
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "upstream_rate_limited",
+            "message": "WhoSampled rate limited the request.",
+        }
+    }
+    assert response.headers["retry-after"] == "120"
+    assert acquisitions == 1
+    assert fetches == 1
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "code=upstream_rate_limited" in messages
+    assert "retry_after_forwarded=True" in messages
+    assert "do-not-log-upstream-body" not in messages
+    assert "do-not-log-header" not in messages
+    assert "120" not in messages
+
+
+def test_rate_limit_redirect_returns_stable_service_unavailable_without_retry() -> None:
+    fetches = 0
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=429,
+            text="rate limited",
+            resolved_url="https://www.whosampled.com/rate-limit/",
+        )
+
+    fetch_samples_page = _browserless_page(fetch_browserlessly)
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "upstream_rate_limited"
+    assert fetches == 1
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [
+        ("Wed, 21 Oct 2015 07:28:00 GMT", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("Sunday, 06-Nov-94 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT"),
+        ("Sun Nov  6 08:49:37 1994", "Sun Nov  6 08:49:37 1994"),
+        ("not a delay or date", None),
+        ("120 seconds", None),
+        ("Wed, 21 Oct 2015 07:28:00 +0000", None),
+        ("Wed, 21 Oct 2015 07:28:00 UTC", None),
+        ("21 Oct 2015 07:28:00 GMT", None),
+        ("Wed, 21 Oct 2015 07:28 GMT", None),
+        ("", None),
+    ],
+)
+def test_rate_limit_forwards_only_valid_retry_after_values(
+    retry_after: str,
+    expected: str | None,
+) -> None:
+    fetch_samples_page = _browserless_page(
+        lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=429,
+            text="rate limited",
+            resolved_url=url,
+            headers={"rEtRy-AfTeR": retry_after},
+        )
+    )
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "upstream_rate_limited"
+    assert response.headers.get("retry-after") == expected
 
 
 def test_repeated_cursors_within_one_source_page_reuse_the_parsed_page() -> None:
@@ -980,6 +1206,7 @@ def test_generated_docs_describe_the_samples_contract() -> None:
             "lookup_timeout",
             "invalid_cursor",
             "collection_changed",
+            "upstream_rate_limited",
         ],
         "title": "Code",
     }
@@ -991,7 +1218,7 @@ def test_generated_docs_describe_the_samples_contract() -> None:
     }
     assert {
         status: operation["responses"][status]["content"]["application/json"]["example"]
-        for status in ("400", "404", "409", "502", "503", "504")
+        for status in ("400", "404", "409", "502", "504")
     } == {
         "400": {
             "detail": {
@@ -1014,17 +1241,35 @@ def test_generated_docs_describe_the_samples_contract() -> None:
                 "message": "WhoSampled returned an unexpected response.",
             }
         },
-        "503": {
-            "detail": {
-                "code": "clearance_failed",
-                "message": "Could not acquire a reusable upstream session.",
-            }
-        },
         "504": {
             "detail": {
                 "code": "lookup_timeout",
                 "message": "The lookup exceeded its 120-second time limit.",
             }
+        },
+    }
+    assert operation["responses"]["503"]["headers"]["Retry-After"] == {
+        "description": "Validated delay or HTTP date supplied by WhoSampled after a rate limit.",
+        "schema": {"type": "string"},
+    }
+    assert operation["responses"]["503"]["content"]["application/json"]["examples"] == {
+        "clearance_failed": {
+            "summary": "Clearance acquisition failed",
+            "value": {
+                "detail": {
+                    "code": "clearance_failed",
+                    "message": "Could not acquire a reusable upstream session.",
+                }
+            },
+        },
+        "upstream_rate_limited": {
+            "summary": "WhoSampled rate limited the request",
+            "value": {
+                "detail": {
+                    "code": "upstream_rate_limited",
+                    "message": "WhoSampled rate limited the request.",
+                }
+            },
         },
     }
 
@@ -1317,6 +1562,8 @@ def test_sequential_requests_reuse_unexpired_clearance(
     page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
     acquisitions = 0
     fetches = 0
+    current_time = 0.0
+    sleeps: list[float] = []
 
     def acquire_clearance(timeout: float) -> ClearanceSession:
         nonlocal acquisitions
@@ -1334,10 +1581,17 @@ def test_sequential_requests_reuse_unexpired_clearance(
         fetches += 1
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
     fetch_samples_page = BrowserlessSamplesPage(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
-        monotonic=lambda: 0.0,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.0,
     )
 
     with caplog.at_level("INFO"), _override_samples_page(
@@ -1414,11 +1668,16 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
 ) -> None:
     acquisitions = 0
     fetches = 0
+    current_time = 0.0
+    fetch_times: list[float] = []
+    sleeps: list[float] = []
+    events: list[str] = []
     page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
 
     def acquire_clearance(timeout: float) -> ClearanceSession:
         nonlocal acquisitions
         acquisitions += 1
+        events.append("acquire")
         return ClearanceSession(
             cookies={"cf_clearance": f"secret-{acquisitions}"},
             user_agent=f"test-agent-{acquisitions}",
@@ -1430,6 +1689,8 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
     ) -> BrowserlessResponse:
         nonlocal fetches
         fetches += 1
+        events.append("fetch")
+        fetch_times.append(current_time)
         if fetches == 1:
             return BrowserlessResponse(
                 status_code=200,
@@ -1438,10 +1699,21 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
             )
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        events.append("pace")
+        sleeps.append(delay)
+        current_time += delay
+
     fetch_samples_page = BrowserlessSamplesPage(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
-        monotonic=lambda: 0.0,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.5,
+        minimum_interval_seconds=2.0,
+        minimum_jitter_seconds=0.25,
+        maximum_jitter_seconds=0.75,
     )
 
     with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
@@ -1450,6 +1722,9 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
     assert response.status_code == 200
     assert acquisitions == 2
     assert fetches == 2
+    assert fetch_times == [0.0, 2.5]
+    assert sleeps == [2.5]
+    assert events == ["acquire", "fetch", "acquire", "pace", "fetch"]
     messages = [record.getMessage() for record in caplog.records]
     assert messages.count("browserless Samples fetch challenged; refreshing clearance") == 1
     assert "secret-" not in "\n".join(messages)
@@ -1483,6 +1758,10 @@ def test_second_browserless_challenge_fails_without_browser_fallback() -> None:
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
     )
 
     with _override_samples_page(fetch_samples_page):
@@ -1492,6 +1771,53 @@ def test_second_browserless_challenge_fails_without_browser_fallback() -> None:
     assert response.json()["detail"]["code"] == "clearance_failed"
     assert acquisitions == 2
     assert fetches == 2
+
+
+def test_challenge_retry_pacing_stops_at_the_complete_lookup_deadline() -> None:
+    current_time = 0.0
+    sleeps: list[float] = []
+    fetches = 0
+
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        if fetches > 1:
+            raise AssertionError("retry must not start after the complete deadline")
+        return BrowserlessResponse(
+            status_code=403,
+            text="<title>Just a moment...</title>",
+            resolved_url=url,
+        )
+
+    fetch_samples_page = BrowserlessSamplesPage(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.0,
+        minimum_interval_seconds=121.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 504
+    assert response.json()["detail"]["code"] == "lookup_timeout"
+    assert fetches == 1
+    assert sleeps == [120.0]
 
 
 def test_clearance_acquisition_exception_has_stable_service_unavailable_response() -> None:
@@ -1669,6 +1995,8 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
     state_lock = Lock()
     acquisitions = 0
     fetches = 0
+    current_time = 0.0
+    sleeps: list[float] = []
 
     def acquire_clearance(timeout: float) -> ClearanceSession:
         nonlocal acquisitions
@@ -1692,10 +2020,17 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
                 raise TimeoutError("test did not release the first fetch")
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
     fetch_samples_page = BrowserlessSamplesPage(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
-        monotonic=lambda: 0.0,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.0,
     )
 
     def request_samples(artist_slug: str) -> int:
@@ -1716,6 +2051,7 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
 
     assert acquisitions == 1
     assert fetches == 2
+    assert sleeps == [4.0]
 
 
 def test_lifecycle_logs_report_acquisition_browserless_fetch_and_parse_count(

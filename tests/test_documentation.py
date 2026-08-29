@@ -16,6 +16,11 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert "pagination.next_cursor" in readme
     assert "collection_changed" in readme
     assert "live collection" in readme
+    assert "four seconds" in readme
+    assert "zero to one second" in readme
+    assert "upstream_rate_limited" in readme
+    assert "Retry-After" in readme
+    assert "Cache hits do not wait" in readme
     assert "python -m pytest" in readme
     assert 'python -m pytest -m live tests/test_live_samples.py -q' in readme
     assert "python -m ruff check ." in readme

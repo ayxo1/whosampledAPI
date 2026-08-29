@@ -50,7 +50,17 @@ construct or edit them.
 The first accepted lookup can open visible Camoufox for up to 90 seconds. A complete lookup has
 a 120-second deadline. Later requests reuse unexpired clearance, and all upstream WhoSampled
 operations are serialized within the process. Run exactly one worker because clearance and
-serialization are process-local.
+request pacing are process-local.
+
+Each uncached WhoSampled data request starts at least four seconds after the previous one, plus
+random jitter from zero to one second. A clearance retry follows the same rule, and pacing wait
+time counts against the 120-second lookup deadline. Cache hits do not wait because they do not
+contact WhoSampled.
+
+If WhoSampled returns HTTP 429, the API does not refresh clearance or retry. It returns
+`503 upstream_rate_limited` instead. When WhoSampled supplies a valid `Retry-After` delay or HTTP
+date, the API forwards that header so the client can decide when to try again. It drops malformed
+values.
 
 ## Verify
 
