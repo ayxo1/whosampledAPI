@@ -39,7 +39,7 @@ class Artist(BaseModel):
 
 
 class Pagination(BaseModel):
-    source_page: int
+    next_cursor: str | None
     returned: int
     has_more: bool
 
@@ -52,7 +52,12 @@ class SamplesResponse(BaseModel):
 
 class ErrorDetail(BaseModel):
     code: Literal[
-        "artist_not_found", "upstream_invalid", "clearance_failed", "lookup_timeout"
+        "artist_not_found",
+        "upstream_invalid",
+        "clearance_failed",
+        "lookup_timeout",
+        "invalid_cursor",
+        "collection_changed",
     ]
     message: str
 

@@ -1,9 +1,12 @@
 import logging
 from typing import Annotated, Literal
+from unicodedata import normalize
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from pydantic import AfterValidator, Field, HttpUrl, ValidationError
 
+from wsmpld.cursor import CursorPosition, InvalidCursorError, decode_cursor, encode_cursor
 from wsmpld.models import Artist, ErrorResponse, Pagination, SamplesResponse
 from wsmpld.parser import parse_samples_page
 from wsmpld.upstream import (
@@ -11,6 +14,7 @@ from wsmpld.upstream import (
     ClearanceFailedError,
     FetchSamplesPage,
     LookupTimeoutError,
+    SamplesPageLocation,
     live_samples_page,
 )
 
@@ -31,6 +35,14 @@ CLEARANCE_FAILED_DETAIL = {
 LOOKUP_TIMEOUT_DETAIL = {
     "code": "lookup_timeout",
     "message": "The lookup exceeded its 120-second time limit.",
+}
+INVALID_CURSOR_DETAIL = {
+    "code": "invalid_cursor",
+    "message": "The Samples cursor is invalid for this request.",
+}
+COLLECTION_CHANGED_DETAIL = {
+    "code": "collection_changed",
+    "message": "The live Samples collection changed; restart the traversal.",
 }
 
 
@@ -74,6 +86,11 @@ def _documented_error(description: str, detail: dict[str, str]) -> dict[str, obj
     }
 
 
+def _samples_collection_url(resolved_url: str) -> HttpUrl:
+    parsed = urlsplit(resolved_url)
+    return HttpUrl(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+
+
 app = FastAPI(
     title="WhoSampled Samples API",
     description="A local API for Sample Uses attributed to a requested artist.",
@@ -84,23 +101,62 @@ app = FastAPI(
     "/artists/{artist_slug:path}/samples",
     response_model=SamplesResponse,
     responses={
+        400: _documented_error("Samples cursor was invalid.", INVALID_CURSOR_DETAIL),
         404: _documented_error("Artist was not found.", ARTIST_NOT_FOUND_DETAIL),
+        409: _documented_error(
+            "The live Samples collection changed.", COLLECTION_CHANGED_DETAIL
+        ),
         502: _documented_error("WhoSampled response was invalid.", UPSTREAM_INVALID_DETAIL),
         503: _documented_error("Upstream clearance failed.", CLEARANCE_FAILED_DETAIL),
         504: _documented_error("Complete lookup timed out.", LOOKUP_TIMEOUT_DETAIL),
     },
     summary="Get an artist's Samples",
+    description=(
+        "Traverse the live Samples collection with an opaque continuation cursor. "
+        "Each request fetches at most one upstream page. A cursor does not create a "
+        "snapshot, so restart the traversal after a collection_changed response."
+    ),
 )
 def read_samples(
     artist_slug: ArtistSlug,
     fetch_samples_page: Annotated[FetchSamplesPage, Depends(get_samples_page)],
     limit: Annotated[
         Annotated[int, Field(gt=0)] | Literal["max"],
-        Query(description="Maximum Sample Uses to return from source page 1, or 'max'."),
+        Query(
+            description=(
+                "Maximum Sample Uses to return from the current cursor position, or "
+                "'max' for the remainder of the current upstream page."
+            )
+        ),
     ] = 1,
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque continuation cursor from pagination.next_cursor. Omit it to start "
+                "a new live traversal."
+            )
+        ),
+    ] = None,
 ) -> SamplesResponse:
     try:
-        page = fetch_samples_page(artist_slug)
+        position = decode_cursor(cursor) if cursor is not None else None
+        if position is not None and position.artist_slug != normalize("NFC", artist_slug):
+            raise InvalidCursorError("Cursor artist does not match request")
+    except InvalidCursorError as error:
+        raise HTTPException(status_code=400, detail=INVALID_CURSOR_DETAIL) from error
+    page_number = position.page_number if position is not None else 1
+    location = (
+        SamplesPageLocation(page_number=page_number)
+        if page_number > 1
+        else None
+    )
+    try:
+        page = (
+            fetch_samples_page(artist_slug)
+            if location is None
+            else fetch_samples_page(artist_slug, location)
+        )
     except ArtistNotFoundError as error:
         raise HTTPException(status_code=404, detail=ARTIST_NOT_FOUND_DETAIL) from error
     except ClearanceFailedError as error:
@@ -111,26 +167,50 @@ def read_samples(
     except Exception as error:
         logger.warning("Samples fetch failed error_type=%s", type(error).__name__)
         raise _upstream_invalid() from error
+    resolved_page_number = page.page_number or page_number
     try:
-        parsed = parse_samples_page(page.html)
+        parsed = parse_samples_page(
+            page.html,
+            artist_slug=artist_slug,
+            page_number=resolved_page_number,
+        )
     except ValueError as error:
         logger.warning("Samples parse failed reason=%s", error)
         raise _upstream_invalid() from error
     logger.info("parsed %d Sample Uses artist_slug=%s", len(parsed.items), artist_slug)
-    items = parsed.items if limit == "max" else parsed.items[:limit]
+    offset = position.item_offset if position is not None else 0
+    if offset > 0 and offset >= len(parsed.items):
+        raise HTTPException(status_code=409, detail=COLLECTION_CHANGED_DETAIL)
+    remaining_items = parsed.items[offset:]
+    items = remaining_items if limit == "max" else remaining_items[:limit]
+    next_offset = offset + len(items)
+    next_position = None
+    if next_offset < len(parsed.items):
+        next_position = CursorPosition(
+            artist_slug=artist_slug,
+            page_number=resolved_page_number,
+            item_offset=next_offset,
+        )
+    elif parsed.next_page_number is not None:
+        next_position = CursorPosition(
+            artist_slug=artist_slug,
+            page_number=parsed.next_page_number,
+            item_offset=0,
+        )
+    next_cursor = encode_cursor(next_position) if next_position is not None else None
     try:
         return SamplesResponse(
             artist=Artist(
                 requested_slug=artist_slug,
                 name=parsed.artist_name,
-                samples_url=HttpUrl(page.resolved_url),
+                samples_url=_samples_collection_url(page.resolved_url),
             ),
             items=items,
             pagination=Pagination(
-                source_page=1,
+                next_cursor=next_cursor,
                 returned=len(items),
-                has_more=len(parsed.items) > len(items),
+                has_more=next_cursor is not None,
             ),
         )
-    except ValidationError as error:
+    except (ValidationError, ValueError) as error:
         raise _upstream_invalid() from error
