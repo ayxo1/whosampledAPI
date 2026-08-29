@@ -58,6 +58,7 @@ class ErrorDetail(BaseModel):
         "lookup_timeout",
         "invalid_cursor",
         "collection_changed",
+        "upstream_rate_limited",
     ]
     message: str
 

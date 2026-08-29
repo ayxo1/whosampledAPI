@@ -1,8 +1,11 @@
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+import random
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from threading import Lock
-from time import monotonic, time
+from time import monotonic, sleep, time
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -11,6 +14,23 @@ from wsmpld.samples_url import BASE_URL, resolved_samples_page_number
 CLEARANCE_TIMEOUT_SECONDS = 90.0
 FETCH_TIMEOUT_SECONDS = 20.0
 LOOKUP_TIMEOUT_SECONDS = 120.0
+MINIMUM_REQUEST_INTERVAL_SECONDS = 4.0
+MINIMUM_REQUEST_JITTER_SECONDS = 0.0
+MAXIMUM_REQUEST_JITTER_SECONDS = 1.0
+
+_HTTP_DATE_PATTERN = re.compile(
+    r"(?:"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+    r"|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"[0-9]{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-[0-9]{2} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+    r"|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?: [0-9]|[0-9]{2}) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}"
+    r")"
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -49,6 +69,7 @@ class BrowserlessResponse:
     status_code: int
     text: str
     resolved_url: str
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 class FetchSamplesPage(Protocol):
@@ -69,6 +90,14 @@ class ClearanceFailedError(Exception):
 
 class LookupTimeoutError(Exception):
     """The complete upstream lookup exceeded its operation deadline."""
+
+
+class UpstreamRateLimitedError(Exception):
+    """WhoSampled rejected the data request because its rate limit was reached."""
+
+    def __init__(self, retry_after: str | None) -> None:
+        super().__init__("WhoSampled rate limited the request")
+        self.retry_after = retry_after
 
 
 class AcquireClearance(Protocol):
@@ -172,6 +201,7 @@ class CurlCffiBrowserlessFetcher:
             status_code=int(response.status_code),
             text=str(response.text),
             resolved_url=str(response.url),
+            headers=dict(response.headers),
         )
 
 
@@ -182,11 +212,22 @@ class BrowserlessSamplesPage:
         acquire_clearance: AcquireClearance,
         fetch_browserlessly: FetchBrowserlessly,
         monotonic: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = sleep,
+        jitter: Callable[[float, float], float] = random.uniform,
+        minimum_interval_seconds: float = MINIMUM_REQUEST_INTERVAL_SECONDS,
+        minimum_jitter_seconds: float = MINIMUM_REQUEST_JITTER_SECONDS,
+        maximum_jitter_seconds: float = MAXIMUM_REQUEST_JITTER_SECONDS,
     ) -> None:
         self._acquire_clearance = acquire_clearance
         self._fetch_browserlessly = fetch_browserlessly
         self._monotonic = monotonic
+        self._sleep = sleep
+        self._jitter = jitter
+        self._minimum_interval_seconds = minimum_interval_seconds
+        self._minimum_jitter_seconds = minimum_jitter_seconds
+        self._maximum_jitter_seconds = maximum_jitter_seconds
         self._clearance: ClearanceSession | None = None
+        self._last_request_started_at: float | None = None
         self._lock = Lock()
 
     def __call__(
@@ -220,6 +261,7 @@ class BrowserlessSamplesPage:
 
             def fetch_validated(current_clearance: ClearanceSession) -> BrowserlessResponse:
                 fetched = self._fetch(url, current_clearance, deadline)
+                _raise_if_rate_limited(fetched)
                 resolved_page = _validate_resolved_samples_url(
                     fetched.resolved_url,
                     artist_slug=artist_slug,
@@ -278,7 +320,9 @@ class BrowserlessSamplesPage:
     def _fetch(
         self, url: str, clearance: ClearanceSession, deadline: float
     ) -> BrowserlessResponse:
+        self._pace(deadline)
         logger.info("browserless Samples fetch started url=%s", url)
+        self._last_request_started_at = self._monotonic()
         try:
             response = self._fetch_browserlessly(
                 url,
@@ -292,10 +336,56 @@ class BrowserlessSamplesPage:
         logger.info("browserless Samples fetch completed status=%d", response.status_code)
         return response
 
+    def _pace(self, deadline: float) -> None:
+        if self._last_request_started_at is None:
+            return
+        jitter = self._jitter(
+            self._minimum_jitter_seconds,
+            self._maximum_jitter_seconds,
+        )
+        next_request_at = (
+            self._last_request_started_at + self._minimum_interval_seconds + jitter
+        )
+        delay = next_request_at - self._monotonic()
+        if delay <= 0:
+            return
+        logger.info("Samples request pacing wait_seconds=%.3f", delay)
+        remaining = self._remaining(deadline)
+        self._sleep(min(delay, remaining))
+        self._remaining(deadline)
+
 
 def _is_challenge(response: BrowserlessResponse) -> bool:
     normalized = response.text.lower()
     return "<title>just a moment" in normalized or "cf-challenge" in normalized
+
+
+def _raise_if_rate_limited(response: BrowserlessResponse) -> None:
+    if response.status_code != 429:
+        return
+    retry_after = next(
+        (
+            value
+            for name, value in response.headers.items()
+            if name.lower() == "retry-after"
+        ),
+        None,
+    )
+    raise UpstreamRateLimitedError(_valid_retry_after(retry_after))
+
+
+def _valid_retry_after(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if re.fullmatch(r"[0-9]+", value):
+        return value
+    if _HTTP_DATE_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value
 
 
 def _validate_resolved_samples_url(
