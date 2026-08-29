@@ -371,7 +371,7 @@ def test_repeated_cursors_within_one_source_page_reuse_the_parsed_page() -> None
     assert requested_locations == [None]
 
 
-def test_expired_parsed_page_is_fetched_again() -> None:
+def test_valid_cursor_continues_after_parsed_page_expires() -> None:
     current_time = 0.0
     page = SamplesPage(
         html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
@@ -404,7 +404,44 @@ def test_expired_parsed_page_is_fetched_again() -> None:
         cached_response.status_code,
         expired_response.status_code,
     ] == [200, 200, 200]
+    assert [
+        item["sampling_recording"]["title"]
+        for item in expired_response.json()["items"]
+    ] == ["Power"]
     assert fetches == 2
+
+
+def test_valid_cursor_continues_after_parsed_page_is_evicted() -> None:
+    page_html = (FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8")
+    fetches: dict[str, int] = {}
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        fetches[artist_slug] = fetches.get(artist_slug, 0) + 1
+        return SamplesPage(
+            html=page_html,
+            resolved_url=f"https://www.whosampled.com/{artist_slug}/samples/",
+        )
+
+    client = TestClient(app)
+    with _override_samples_page(fetch, page_cache=ParsedSamplesPageCache(capacity=1)):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        eviction_response = client.get("/artists/Jay-Z/samples")
+        continued_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+
+    assert [
+        first_response.status_code,
+        eviction_response.status_code,
+        continued_response.status_code,
+    ] == [200, 200, 200]
+    assert [
+        item["sampling_recording"]["title"]
+        for item in continued_response.json()["items"]
+    ] == ["Power"]
+    assert fetches == {"Kanye-West": 2, "Jay-Z": 1}
 
 
 def test_least_recently_used_page_is_fetched_again_after_capacity_eviction() -> None:
@@ -850,10 +887,48 @@ def test_live_page_change_that_invalidates_cursor_offset_returns_conflict() -> N
     assert changed_response.json() == {
         "detail": {
             "code": "collection_changed",
-            "message": "The live Samples collection changed; restart the traversal.",
+            "message": "The live Samples collection changed; restart without a cursor.",
         }
     }
     assert fetches == 2
+
+
+def test_evicted_page_change_that_invalidates_cursor_offset_returns_conflict() -> None:
+    original_html = (FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8")
+    changed_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    kanye_fetches = 0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal kanye_fetches
+        if artist_slug == "Kanye-West":
+            kanye_fetches += 1
+            html = original_html if kanye_fetches == 1 else changed_html
+        else:
+            html = changed_html
+        return SamplesPage(
+            html=html,
+            resolved_url=f"https://www.whosampled.com/{artist_slug}/samples/",
+        )
+
+    client = TestClient(app)
+    with _override_samples_page(fetch, page_cache=ParsedSamplesPageCache(capacity=1)):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        eviction_response = client.get("/artists/Jay-Z/samples")
+        changed_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor},
+        )
+
+    assert [first_response.status_code, eviction_response.status_code] == [200, 200]
+    assert changed_response.status_code == 409
+    assert changed_response.json() == {
+        "detail": {
+            "code": "collection_changed",
+            "message": "The live Samples collection changed; restart without a cursor.",
+        }
+    }
+    assert kanye_fetches == 2
 
 
 def test_internal_continuation_location_fetches_later_samples_page() -> None:
@@ -1232,7 +1307,7 @@ def test_generated_docs_describe_the_samples_contract() -> None:
         "409": {
             "detail": {
                 "code": "collection_changed",
-                "message": "The live Samples collection changed; restart the traversal.",
+                "message": "The live Samples collection changed; restart without a cursor.",
             }
         },
         "502": {
