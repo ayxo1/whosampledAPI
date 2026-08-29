@@ -12,7 +12,8 @@ import pytest
 from curl_cffi.requests.exceptions import TooManyRedirects
 from fastapi.testclient import TestClient
 
-from wsmpld.api import app, get_samples_page
+from wsmpld.api import app, get_samples_page, get_samples_page_cache
+from wsmpld.page_cache import ParsedSamplesPageCache
 from wsmpld.upstream import (
     ArtistNotFoundError,
     BrowserlessResponse,
@@ -37,8 +38,14 @@ def _opaque_cursor_payload(payload: object) -> str:
 
 
 @contextmanager
-def _override_samples_page(fetch_samples_page: FetchSamplesPage) -> Iterator[None]:
+def _override_samples_page(
+    fetch_samples_page: FetchSamplesPage,
+    *,
+    page_cache: ParsedSamplesPageCache | None = None,
+) -> Iterator[None]:
+    page_cache = page_cache or ParsedSamplesPageCache()
     app.dependency_overrides[get_samples_page] = lambda: fetch_samples_page
+    app.dependency_overrides[get_samples_page_cache] = lambda: page_cache
     try:
         yield
     finally:
@@ -93,7 +100,7 @@ def test_user_receives_one_sample_use_by_default() -> None:
     }
 
 
-def test_user_continues_with_an_opaque_cursor_and_can_change_limit() -> None:
+def test_repeated_cursors_within_one_source_page_reuse_the_parsed_page() -> None:
     page = SamplesPage(
         html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
         resolved_url="https://www.whosampled.com/Kanye-West/samples/",
@@ -135,7 +142,253 @@ def test_user_continues_with_an_opaque_cursor_and_can_change_limit() -> None:
         "returned": 1,
         "has_more": False,
     }
-    assert requested_locations == [None, None]
+    assert requested_locations == [None]
+
+
+def test_expired_parsed_page_is_fetched_again() -> None:
+    current_time = 0.0
+    page = SamplesPage(
+        html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    fetches = 0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return page
+
+    page_cache = ParsedSamplesPageCache(monotonic=lambda: current_time)
+    client = TestClient(app)
+    with _override_samples_page(fetch, page_cache=page_cache):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        cached_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+        current_time = 600.0
+        expired_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+
+    assert [
+        first_response.status_code,
+        cached_response.status_code,
+        expired_response.status_code,
+    ] == [200, 200, 200]
+    assert fetches == 2
+
+
+def test_least_recently_used_page_is_fetched_again_after_capacity_eviction() -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    fetches: dict[str, int] = {}
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        fetches[artist_slug] = fetches.get(artist_slug, 0) + 1
+        return SamplesPage(
+            html=page_html,
+            resolved_url=f"https://www.whosampled.com/{artist_slug}/samples/",
+        )
+
+    page_cache = ParsedSamplesPageCache(capacity=2)
+    client = TestClient(app)
+    with _override_samples_page(fetch, page_cache=page_cache):
+        responses = [
+            client.get(f"/artists/{artist_slug}/samples")
+            for artist_slug in [
+                "Kanye-West",
+                "Jay-Z",
+                "Kanye-West",
+                "Drake",
+                "Jay-Z",
+            ]
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200, 200]
+    assert fetches == {"Kanye-West": 1, "Jay-Z": 2, "Drake": 1}
+
+
+def test_normalized_artist_collection_slugs_share_a_cache_entry() -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    fetches = 0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return SamplesPage(
+            html=page_html,
+            resolved_url="https://www.whosampled.com/Beyonc%C3%A9/samples/",
+        )
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        composed_response = client.get("/artists/Beyonc%C3%A9/samples")
+        decomposed_response = client.get("/artists/Beyonce%CC%81/samples")
+
+    assert [composed_response.status_code, decomposed_response.status_code] == [200, 200]
+    assert fetches == 1
+
+
+def test_concurrent_cache_misses_share_one_upstream_fetch() -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    first_fetch_started = Event()
+    release_first_fetch = Event()
+    second_cache_lookup = Event()
+    clock_lock = Lock()
+    clock_reads = 0
+    fetches = 0
+
+    def monotonic() -> float:
+        nonlocal clock_reads
+        with clock_lock:
+            clock_reads += 1
+            if clock_reads == 2:
+                second_cache_lookup.set()
+        return 0.0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            first_fetch_started.set()
+            if not release_first_fetch.wait(timeout=2):
+                raise TimeoutError("test did not release the first fetch")
+        return SamplesPage(
+            html=page_html,
+            resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+        )
+
+    page_cache = ParsedSamplesPageCache(monotonic=monotonic)
+
+    def request_samples() -> tuple[int, dict[str, object]]:
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+        return response.status_code, response.json()
+
+    with (
+        _override_samples_page(fetch, page_cache=page_cache),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        first_response = pool.submit(request_samples)
+        assert first_fetch_started.wait(timeout=2)
+        second_response = pool.submit(request_samples)
+        assert second_cache_lookup.wait(timeout=2)
+        try:
+            second_finished_before_first = second_response.result(timeout=0.2)
+        except FutureTimeoutError:
+            second_finished_before_first = None
+        finally:
+            release_first_fetch.set()
+
+        response_results = [first_response.result(timeout=2), second_response.result(timeout=2)]
+
+    assert second_finished_before_first is None
+    assert fetches == 1
+    assert response_results[0] == response_results[1]
+
+
+@pytest.mark.parametrize(
+    ("failed_outcome", "expected_status"),
+    [
+        ("fetch", 502),
+        ("challenge", 503),
+        ("parse", 502),
+    ],
+)
+def test_unsuccessful_pages_are_not_retained(
+    failed_outcome: str,
+    expected_status: int,
+) -> None:
+    valid_page = SamplesPage(
+        html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    fetches = 0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        if fetches > 1:
+            return valid_page
+        if failed_outcome == "fetch":
+            raise RuntimeError("upstream fetch failed")
+        if failed_outcome == "challenge":
+            raise ClearanceFailedError("browserless retry was challenged")
+        return SamplesPage(
+            html="<html><main></main></html>",
+            resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+        )
+
+    client = TestClient(app, raise_server_exceptions=False)
+    with _override_samples_page(fetch):
+        failed_response = client.get("/artists/Kanye-West/samples")
+        retry_response = client.get("/artists/Kanye-West/samples")
+
+    assert [failed_response.status_code, retry_response.status_code] == [
+        expected_status,
+        200,
+    ]
+    assert fetches == 2
+
+
+def test_concurrent_callers_share_a_failure_without_caching_it() -> None:
+    valid_page = SamplesPage(
+        html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    failed_fetch_started = Event()
+    release_failed_fetch = Event()
+    second_cache_lookup = Event()
+    clock_lock = Lock()
+    clock_reads = 0
+    fetches = 0
+
+    def monotonic() -> float:
+        nonlocal clock_reads
+        with clock_lock:
+            clock_reads += 1
+            if clock_reads == 2:
+                second_cache_lookup.set()
+        return 0.0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            failed_fetch_started.set()
+            if not release_failed_fetch.wait(timeout=2):
+                raise TimeoutError("test did not release the failed fetch")
+            raise RuntimeError("shared upstream failure")
+        return valid_page
+
+    page_cache = ParsedSamplesPageCache(monotonic=monotonic)
+
+    def request_samples() -> tuple[int, dict[str, object]]:
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/artists/Kanye-West/samples"
+        )
+        return response.status_code, response.json()
+
+    with (
+        _override_samples_page(fetch, page_cache=page_cache),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        first_response = pool.submit(request_samples)
+        assert failed_fetch_started.wait(timeout=2)
+        second_response = pool.submit(request_samples)
+        assert second_cache_lookup.wait(timeout=2)
+        release_failed_fetch.set()
+        failed_responses = [
+            first_response.result(timeout=2),
+            second_response.result(timeout=2),
+        ]
+        retry_response = request_samples()
+
+    assert failed_responses[0] == failed_responses[1]
+    assert failed_responses[0][0] == 502
+    assert retry_response[0] == 200
+    assert fetches == 2
 
 
 def test_user_crosses_a_validated_page_boundary_without_an_extra_fetch() -> None:
@@ -324,7 +577,10 @@ def test_live_page_change_that_invalidates_cursor_offset_returns_conflict() -> N
         return original_page if fetches == 1 else changed_page
 
     client = TestClient(app)
-    with _override_samples_page(fetch):
+    with _override_samples_page(
+        fetch,
+        page_cache=ParsedSamplesPageCache(lifetime_seconds=0),
+    ):
         first_response = client.get("/artists/Kanye-West/samples?limit=1")
         cursor = first_response.json()["pagination"]["next_cursor"]
         changed_response = client.get(
@@ -1037,7 +1293,10 @@ def test_sequential_requests_reuse_unexpired_clearance(
         monotonic=lambda: 0.0,
     )
 
-    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+    with caplog.at_level("INFO"), _override_samples_page(
+        fetch_samples_page,
+        page_cache=ParsedSamplesPageCache(lifetime_seconds=0),
+    ):
         responses = [
             TestClient(app).get("/artists/Kanye-West/samples")
             for _ in range(2)
@@ -1086,7 +1345,10 @@ def test_expired_clearance_is_discarded_before_next_request(
         monotonic=lambda: current_time,
     )
 
-    with caplog.at_level("INFO"), _override_samples_page(fetch_samples_page):
+    with caplog.at_level("INFO"), _override_samples_page(
+        fetch_samples_page,
+        page_cache=ParsedSamplesPageCache(lifetime_seconds=0),
+    ):
         first_response = TestClient(app).get("/artists/Kanye-West/samples")
         current_time = 10.0
         second_response = TestClient(app).get("/artists/Kanye-West/samples")
@@ -1389,13 +1651,13 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
         monotonic=lambda: 0.0,
     )
 
-    def request_samples() -> int:
-        return TestClient(app).get("/artists/Kanye-West/samples").status_code
+    def request_samples(artist_slug: str) -> int:
+        return TestClient(app).get(f"/artists/{artist_slug}/samples").status_code
 
     with _override_samples_page(fetch_samples_page), ThreadPoolExecutor(max_workers=2) as pool:
-        first_response = pool.submit(request_samples)
+        first_response = pool.submit(request_samples, "Kanye-West")
         assert first_fetch_started.wait(timeout=2)
-        second_response = pool.submit(request_samples)
+        second_response = pool.submit(request_samples, "Jay-Z")
         try:
             with pytest.raises(FutureTimeoutError):
                 second_response.result(timeout=0.5)
