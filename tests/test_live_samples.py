@@ -115,7 +115,7 @@ def _traverse_running_api(
 
 
 @pytest.mark.live
-def test_two_live_kanye_west_requests_reuse_browser_clearance() -> None:
+def test_two_live_kanye_west_requests_reuse_the_parsed_page() -> None:
     responses, request_error, logs = _request_running_api(
         ["/artists/Kanye-West/samples"] * 2
     )
@@ -132,10 +132,10 @@ def test_two_live_kanye_west_requests_reuse_browser_clearance() -> None:
     assert all(result.items for result in parsed)
 
     assert logs.count("visible unattended Camoufox clearance acquisition started") == 1
-    assert logs.count("reusing unexpired clearance session") == 1
-    assert logs.count("browserless Samples fetch started") == 2
-    assert logs.count("Samples data fetch started transport=curl_cffi") == 2
-    assert logs.count("Samples data fetch started") == 2
+    assert logs.count("Samples page cache hit") == 1
+    assert logs.count("browserless Samples fetch started") == 1
+    assert logs.count("Samples data fetch started transport=curl_cffi") == 1
+    assert logs.count("Samples data fetch started") == 1
 
 
 @pytest.mark.live
@@ -177,4 +177,5 @@ def test_live_small_collection_traverses_with_cursors_until_completion() -> None
     assert parsed[-1].pagination.next_cursor is None
     assert all(result.items for result in parsed)
     assert logs.count("visible unattended Camoufox clearance acquisition started") == 1
-    assert logs.count("browserless Samples fetch started") == len(responses)
+    assert logs.count("Samples page cache hit") == 1
+    assert logs.count("browserless Samples fetch started") == len(responses) - 1

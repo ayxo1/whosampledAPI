@@ -8,7 +8,7 @@ from pydantic import AfterValidator, Field, HttpUrl, ValidationError
 
 from wsmpld.cursor import CursorPosition, InvalidCursorError, decode_cursor, encode_cursor
 from wsmpld.models import Artist, ErrorResponse, Pagination, SamplesResponse
-from wsmpld.parser import parse_samples_page
+from wsmpld.page_cache import ParsedSamplesPageCache
 from wsmpld.upstream import (
     ArtistNotFoundError,
     ClearanceFailedError,
@@ -74,6 +74,13 @@ def get_samples_page() -> FetchSamplesPage:
     return live_samples_page
 
 
+samples_page_cache = ParsedSamplesPageCache()
+
+
+def get_samples_page_cache() -> ParsedSamplesPageCache:
+    return samples_page_cache
+
+
 def _upstream_invalid() -> HTTPException:
     return HTTPException(status_code=502, detail=UPSTREAM_INVALID_DETAIL)
 
@@ -120,6 +127,7 @@ app = FastAPI(
 def read_samples(
     artist_slug: ArtistSlug,
     fetch_samples_page: Annotated[FetchSamplesPage, Depends(get_samples_page)],
+    page_cache: Annotated[ParsedSamplesPageCache, Depends(get_samples_page_cache)],
     limit: Annotated[
         Annotated[int, Field(gt=0)] | Literal["max"],
         Query(
@@ -152,11 +160,7 @@ def read_samples(
         else None
     )
     try:
-        page = (
-            fetch_samples_page(artist_slug)
-            if location is None
-            else fetch_samples_page(artist_slug, location)
-        )
+        cached_page = page_cache.get_or_fetch(artist_slug, location, fetch_samples_page)
     except ArtistNotFoundError as error:
         raise HTTPException(status_code=404, detail=ARTIST_NOT_FOUND_DETAIL) from error
     except ClearanceFailedError as error:
@@ -164,19 +168,14 @@ def read_samples(
     except LookupTimeoutError as error:
         logger.info("Samples lookup timed out artist_slug=%s", artist_slug)
         raise HTTPException(status_code=504, detail=LOOKUP_TIMEOUT_DETAIL) from error
-    except Exception as error:
-        logger.warning("Samples fetch failed error_type=%s", type(error).__name__)
-        raise _upstream_invalid() from error
-    resolved_page_number = page.page_number or page_number
-    try:
-        parsed = parse_samples_page(
-            page.html,
-            artist_slug=artist_slug,
-            page_number=resolved_page_number,
-        )
     except ValueError as error:
         logger.warning("Samples parse failed reason=%s", error)
         raise _upstream_invalid() from error
+    except Exception as error:
+        logger.warning("Samples fetch failed error_type=%s", type(error).__name__)
+        raise _upstream_invalid() from error
+    page = cached_page.source
+    parsed = cached_page.parsed
     logger.info("parsed %d Sample Uses artist_slug=%s", len(parsed.items), artist_slug)
     offset = position.item_offset if position is not None else 0
     if offset > 0 and offset >= len(parsed.items):
@@ -188,7 +187,7 @@ def read_samples(
     if next_offset < len(parsed.items):
         next_position = CursorPosition(
             artist_slug=artist_slug,
-            page_number=resolved_page_number,
+            page_number=page_number,
             item_offset=next_offset,
         )
     elif parsed.next_page_number is not None:
