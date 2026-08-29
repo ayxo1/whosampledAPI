@@ -1,3 +1,5 @@
+import base64
+import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -27,6 +29,13 @@ from wsmpld.upstream import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def _opaque_cursor_payload(payload: object) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    )
+    return encoded.rstrip(b"=").decode("ascii")
+
+
 @contextmanager
 def _override_samples_page(fetch_samples_page: FetchSamplesPage) -> Iterator[None]:
     app.dependency_overrides[get_samples_page] = lambda: fetch_samples_page
@@ -46,18 +55,6 @@ def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSam
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
     )
-
-
-def _at_samples_page(
-    page_fetch: BrowserlessSamplesPage,
-    page_number: int,
-) -> FetchSamplesPage:
-    location = SamplesPageLocation(page_number=page_number)
-
-    def fetch(artist_slug: str) -> SamplesPage:
-        return page_fetch(artist_slug, location)
-
-    return fetch
 
 
 def test_user_receives_one_sample_use_by_default() -> None:
@@ -92,8 +89,258 @@ def test_user_receives_one_sample_use_by_default() -> None:
                 },
             }
         ],
-        "pagination": {"source_page": 1, "returned": 1, "has_more": False},
+        "pagination": {"next_cursor": None, "returned": 1, "has_more": False},
     }
+
+
+def test_user_continues_with_an_opaque_cursor_and_can_change_limit() -> None:
+    page = SamplesPage(
+        html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    requested_locations: list[SamplesPageLocation | None] = []
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        requested_locations.append(location)
+        return page
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        second_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": 20},
+        )
+
+    assert first_response.status_code == 200
+    assert [
+        item["sampling_recording"]["title"] for item in first_response.json()["items"]
+    ] == ["Famous"]
+    assert first_response.json()["pagination"] == {
+        "next_cursor": cursor,
+        "returned": 1,
+        "has_more": True,
+    }
+    assert isinstance(cursor, str) and cursor
+    assert second_response.status_code == 200
+    assert [
+        item["sampling_recording"]["title"] for item in second_response.json()["items"]
+    ] == ["Power"]
+    assert second_response.json()["pagination"] == {
+        "next_cursor": None,
+        "returned": 1,
+        "has_more": False,
+    }
+    assert requested_locations == [None, None]
+
+
+def test_user_crosses_a_validated_page_boundary_without_an_extra_fetch() -> None:
+    first_page = SamplesPage(
+        html=(FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    final_page_html = (FIXTURES / "live_samples_final_page.html").read_text(
+        encoding="utf-8"
+    )
+    final_page_html = final_page_html.replace("?sp=78", "").replace(
+        '<span class="page"><a href="/Kanye-West/samples/">1</a></span>',
+        "",
+    )
+    final_page_html = final_page_html.replace(">78<", ">1<").replace(">79<", ">2<")
+    final_page = SamplesPage(
+        html=final_page_html,
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/?sp=2",
+    )
+    requested_locations: list[SamplesPageLocation | None] = []
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        requested_locations.append(location)
+        return first_page if location is None else final_page
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        first_response = client.get("/artists/Kanye-West/samples?limit=max")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        final_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+
+    assert first_response.status_code == 200
+    assert first_response.json()["items"][0]["sampling_recording"]["title"] == "Bound 2"
+    assert isinstance(cursor, str) and cursor
+    assert final_response.status_code == 200
+    assert final_response.json()["items"][0]["sampling_recording"]["title"] == (
+        "Forever La Vida"
+    )
+    assert final_response.json()["artist"]["samples_url"] == (
+        "https://www.whosampled.com/Kanye-West/samples/"
+    )
+    assert final_response.json()["pagination"] == {
+        "next_cursor": None,
+        "returned": 1,
+        "has_more": False,
+    }
+    assert [
+        location.page_number if location is not None else None
+        for location in requested_locations
+    ] == [None, 2]
+
+
+def test_malformed_cursor_is_rejected_before_upstream_work() -> None:
+    fetches = 0
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        raise AssertionError("upstream fetch must not run for an invalid cursor")
+
+    with _override_samples_page(fetch):
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": "not-a-cursor"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {
+            "code": "invalid_cursor",
+            "message": "The Samples cursor is invalid for this request.",
+        }
+    }
+    assert fetches == 0
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        _opaque_cursor_payload(
+            {"artist": "Kanye-West", "offset": 1, "page": 1, "version": 2}
+        ),
+        _opaque_cursor_payload(
+            {"artist": "Kanye-West", "offset": 1, "page": 1}
+        ),
+        _opaque_cursor_payload(
+            {
+                "artist": "Kanye-West",
+                "extra": True,
+                "offset": 1,
+                "page": 1,
+                "version": 1,
+            }
+        ),
+        _opaque_cursor_payload(
+            {"artist": "Kanye-West", "offset": 0, "page": 1, "version": 1}
+        ),
+        _opaque_cursor_payload(
+            {"artist": "Kanye-West", "offset": -1, "page": 2, "version": 1}
+        ),
+        _opaque_cursor_payload(
+            {"artist": "Kanye-West", "offset": 1, "page": True, "version": 1}
+        ),
+    ],
+)
+def test_impossible_or_unsupported_cursor_is_rejected_before_upstream_work(
+    cursor: str,
+) -> None:
+    fetches = 0
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        raise AssertionError("upstream fetch must not run for an invalid cursor")
+
+    with _override_samples_page(fetch):
+        response = TestClient(app).get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_cursor"
+    assert fetches == 0
+
+
+def test_cursor_for_another_artist_is_rejected_before_upstream_work() -> None:
+    page = SamplesPage(
+        html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    fetches = 0
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return page
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        mismatched_response = client.get(
+            "/artists/Jay-Z/samples",
+            params={"cursor": cursor},
+        )
+
+    assert first_response.status_code == 200
+    assert mismatched_response.status_code == 400
+    assert mismatched_response.json()["detail"]["code"] == "invalid_cursor"
+    assert fetches == 1
+
+
+def test_live_page_change_that_invalidates_cursor_offset_returns_conflict() -> None:
+    original_page = SamplesPage(
+        html=(FIXTURES / "multiple_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    changed_page = SamplesPage(
+        html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    fetches = 0
+
+    def fetch(
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return original_page if fetches == 1 else changed_page
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        first_response = client.get("/artists/Kanye-West/samples?limit=1")
+        cursor = first_response.json()["pagination"]["next_cursor"]
+        changed_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor},
+        )
+
+    assert first_response.status_code == 200
+    assert changed_response.status_code == 409
+    assert changed_response.json() == {
+        "detail": {
+            "code": "collection_changed",
+            "message": "The live Samples collection changed; restart the traversal.",
+        }
+    }
+    assert fetches == 2
 
 
 def test_internal_continuation_location_fetches_later_samples_page() -> None:
@@ -108,12 +355,20 @@ def test_internal_continuation_location_fetches_later_samples_page() -> None:
 
     page_fetch = _browserless_page(fetch_browserlessly)
 
-    with _override_samples_page(_at_samples_page(page_fetch, 40)):
-        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+    cursor = _opaque_cursor_payload(
+        {"artist": "Kanye-West", "offset": 0, "page": 40, "version": 1}
+    )
+    with _override_samples_page(page_fetch):
+        response = TestClient(app).get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
 
     assert response.status_code == 200
     assert requested_urls == ["https://www.whosampled.com/Kanye-West/samples/?sp=40"]
-    assert response.json()["artist"]["samples_url"] == requested_urls[0]
+    assert response.json()["artist"]["samples_url"] == (
+        "https://www.whosampled.com/Kanye-West/samples/"
+    )
     assert response.json()["items"][0]["sampling_recording"]["title"] == (
         "Fight With the Best"
     )
@@ -184,8 +439,14 @@ def test_unexpected_continuation_redirect_has_stable_bad_gateway_response(
         )
     )
 
-    with _override_samples_page(_at_samples_page(page_fetch, 40)):
-        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+    cursor = _opaque_cursor_payload(
+        {"artist": "Kanye-West", "offset": 0, "page": 40, "version": 1}
+    )
+    with _override_samples_page(page_fetch):
+        response = TestClient(app).get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
 
     assert response.status_code == 502
     assert response.json() == {
@@ -197,22 +458,64 @@ def test_unexpected_continuation_redirect_has_stable_bad_gateway_response(
 
 
 def test_forward_redirect_within_artist_samples_collection_is_accepted() -> None:
-    page_html = (FIXTURES / "live_samples_middle_page.html").read_text(encoding="utf-8")
-    page_fetch = _browserless_page(
-        lambda url, clearance, timeout: BrowserlessResponse(
+    middle_page_html = (FIXTURES / "live_samples_middle_page.html").read_text(
+        encoding="utf-8"
+    )
+    middle_page_html = middle_page_html.replace("?sp=41", "?sp=42").replace(
+        '<span class="curr">40</span>',
+        '<span class="curr">41</span>',
+    )
+    middle_page_html = middle_page_html.replace(">41</a>", ">42</a>")
+    final_page_html = (FIXTURES / "live_samples_final_page.html").read_text(
+        encoding="utf-8"
+    ).replace('<span class="curr">79</span>', '<span class="curr">42</span>')
+    requested_urls: list[str] = []
+
+    def fetch_browserlessly(
+        url: str,
+        clearance: ClearanceSession,
+        timeout: float,
+    ) -> BrowserlessResponse:
+        requested_urls.append(url)
+        if url.endswith("?sp=40"):
+            return BrowserlessResponse(
+                status_code=200,
+                text=middle_page_html,
+                resolved_url="https://www.whosampled.com/Kanye-West/samples/?sp=41",
+            )
+        return BrowserlessResponse(
             status_code=200,
-            text=page_html,
-            resolved_url="https://www.whosampled.com/Kanye-West/samples/?sp=41",
+            text=final_page_html,
+            resolved_url="https://www.whosampled.com/Kanye-West/samples/?sp=42",
         )
-    )
 
-    with _override_samples_page(_at_samples_page(page_fetch, 40)):
-        response = TestClient(app).get("/artists/Kanye-West/samples?limit=max")
+    page_fetch = _browserless_page(fetch_browserlessly)
 
-    assert response.status_code == 200
-    assert response.json()["artist"]["samples_url"] == (
-        "https://www.whosampled.com/Kanye-West/samples/?sp=41"
+    cursor = _opaque_cursor_payload(
+        {"artist": "Kanye-West", "offset": 0, "page": 40, "version": 1}
     )
+    client = TestClient(app)
+    with _override_samples_page(page_fetch):
+        redirected_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": cursor, "limit": "max"},
+        )
+        next_cursor = redirected_response.json()["pagination"]["next_cursor"]
+        final_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": next_cursor, "limit": "max"},
+        )
+
+    assert redirected_response.status_code == 200
+    assert redirected_response.json()["artist"]["samples_url"] == (
+        "https://www.whosampled.com/Kanye-West/samples/"
+    )
+    assert final_response.status_code == 200
+    assert final_response.json()["pagination"]["next_cursor"] is None
+    assert requested_urls == [
+        "https://www.whosampled.com/Kanye-West/samples/?sp=40",
+        "https://www.whosampled.com/Kanye-West/samples/?sp=42",
+    ]
 
 
 def test_initial_page_redirect_to_another_artist_has_stable_bad_gateway_response() -> None:
@@ -340,11 +643,20 @@ def test_generated_docs_describe_the_samples_contract() -> None:
     assert [(parameter["name"], parameter["in"]) for parameter in operation["parameters"]] == [
         ("artist_slug", "path"),
         ("limit", "query"),
+        ("cursor", "query"),
     ]
+    assert "live Samples collection" in operation["description"]
+    assert "at most one upstream page" in operation["description"]
     assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/SamplesResponse"
     }
     assert operation["responses"]["404"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+    assert operation["responses"]["400"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+    assert operation["responses"]["409"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/ErrorResponse"
     }
     assert operation["responses"]["502"]["content"]["application/json"]["schema"] == {
@@ -363,15 +675,35 @@ def test_generated_docs_describe_the_samples_contract() -> None:
             "upstream_invalid",
             "clearance_failed",
             "lookup_timeout",
+            "invalid_cursor",
+            "collection_changed",
         ],
         "title": "Code",
     }
+    pagination_schema = schema["components"]["schemas"]["Pagination"]
+    assert "source_page" not in pagination_schema["properties"]
+    assert pagination_schema["properties"]["next_cursor"] == {
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "title": "Next Cursor",
+    }
     assert {
         status: operation["responses"][status]["content"]["application/json"]["example"]
-        for status in ("404", "502", "503", "504")
+        for status in ("400", "404", "409", "502", "503", "504")
     } == {
+        "400": {
+            "detail": {
+                "code": "invalid_cursor",
+                "message": "The Samples cursor is invalid for this request.",
+            }
+        },
         "404": {
             "detail": {"code": "artist_not_found", "message": "Artist was not found."}
+        },
+        "409": {
+            "detail": {
+                "code": "collection_changed",
+                "message": "The live Samples collection changed; restart the traversal.",
+            }
         },
         "502": {
             "detail": {
@@ -407,7 +739,7 @@ def test_user_can_request_every_sample_use_on_the_current_page() -> None:
         item["sampling_recording"]["title"] for item in response.json()["items"]
     ] == ["Famous", "Power"]
     assert response.json()["pagination"] == {
-        "source_page": 1,
+        "next_cursor": None,
         "returned": 2,
         "has_more": False,
     }
@@ -445,7 +777,7 @@ def test_2pac_samples_use_page_artist_when_live_track_credit_is_implicit() -> No
                 },
             }
         ],
-        "pagination": {"source_page": 1, "returned": 1, "has_more": False},
+        "pagination": {"next_cursor": None, "returned": 1, "has_more": False},
     }
 
 
@@ -497,15 +829,14 @@ def test_positive_numeric_limit_applies_to_current_page_sample_uses() -> None:
     assert [
         item["sampling_recording"]["title"] for item in limited_response.json()["items"]
     ] == ["Famous"]
-    assert limited_response.json()["pagination"] == {
-        "source_page": 1,
-        "returned": 1,
-        "has_more": True,
-    }
+    limited_pagination = limited_response.json()["pagination"]
+    assert isinstance(limited_pagination["next_cursor"], str)
+    assert limited_pagination["returned"] == 1
+    assert limited_pagination["has_more"] is True
     assert oversized_response.status_code == 200
     assert len(oversized_response.json()["items"]) == 2
     assert oversized_response.json()["pagination"] == {
-        "source_page": 1,
+        "next_cursor": None,
         "returned": 2,
         "has_more": False,
     }
@@ -524,11 +855,10 @@ def test_limit_applies_after_display_groups_are_flattened() -> None:
         "First Source",
         "Second Source",
     ]
-    assert response.json()["pagination"] == {
-        "source_page": 1,
-        "returned": 2,
-        "has_more": True,
-    }
+    pagination = response.json()["pagination"]
+    assert isinstance(pagination["next_cursor"], str)
+    assert pagination["returned"] == 2
+    assert pagination["has_more"] is True
 
 
 def test_invalid_limits_receive_normal_validation_errors() -> None:
@@ -1131,7 +1461,7 @@ def test_existing_artist_without_sample_uses_has_empty_success_response() -> Non
             "samples_url": "https://www.whosampled.com/No-Samples-Artist/samples/",
         },
         "items": [],
-        "pagination": {"source_page": 1, "returned": 0, "has_more": False},
+        "pagination": {"next_cursor": None, "returned": 0, "has_more": False},
     }
 
 

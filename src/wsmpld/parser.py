@@ -7,14 +7,14 @@ from lxml import html
 from pydantic import HttpUrl
 
 from wsmpld.models import SampleUse, SamplingRecording, SourceRecording
-
-BASE_URL = "https://www.whosampled.com"
+from wsmpld.samples_url import BASE_URL, samples_page_link_number
 
 
 @dataclass(frozen=True)
 class ParsedSamplesPage:
     artist_name: str
     items: list[SampleUse]
+    next_page_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,54 @@ def _live_year(element: html.HtmlElement, selector: str) -> int | None:
     return int(match.group(1))
 
 
-def _live_samples_page(root: html.HtmlElement) -> ParsedSamplesPage:
+def _next_page_number(
+    root: html.HtmlElement,
+    *,
+    artist_slug: str | None,
+    page_number: int,
+) -> int | None:
+    pagination = _elements(root, f"//*[{_xpath_has_class('pagination')}]")
+    if not pagination:
+        return None
+    if len(pagination) != 1 or artist_slug is None:
+        raise ValueError("Invalid Samples pagination controls")
+    current = _elements(pagination[0], f".//*[{_xpath_has_class('curr')}]")
+    if len(current) != 1 or " ".join(current[0].text_content().split()) != str(page_number):
+        raise ValueError("Invalid Samples pagination controls")
+    links = _elements(pagination[0], ".//a")
+    destination_pages: dict[html.HtmlElement, int] = {}
+    for link in links:
+        href = link.get("href")
+        if href is None:
+            raise ValueError("Invalid Samples pagination controls")
+        try:
+            destination_pages[link] = samples_page_link_number(href, artist_slug)
+        except ValueError as error:
+            raise ValueError("Invalid Samples pagination controls") from error
+    next_controls = _elements(
+        pagination[0],
+        f".//*[{_xpath_has_class('next')}]",
+    )
+    next_links = _elements(pagination[0], ".//a[@rel='next']")
+    if not next_controls and not next_links:
+        return None
+    if len(next_controls) != 1 or len(next_links) != 1:
+        raise ValueError("Invalid Samples pagination controls")
+    control_links = _elements(next_controls[0], ".//a[@rel='next']")
+    if control_links != next_links:
+        raise ValueError("Invalid Samples pagination controls")
+    next_page = destination_pages[next_links[0]]
+    if next_page != page_number + 1:
+        raise ValueError("Invalid Samples pagination controls")
+    return next_page
+
+
+def _live_samples_page(
+    root: html.HtmlElement,
+    *,
+    artist_slug: str | None,
+    page_number: int,
+) -> ParsedSamplesPage:
     artist_elements = _elements(root, f"//*[{_xpath_has_class('artistName')}]")
     if len(artist_elements) != 1:
         raise ValueError("Missing artist metadata")
@@ -175,14 +222,31 @@ def _live_samples_page(root: html.HtmlElement) -> ParsedSamplesPage:
                     ),
                 )
             )
-    return ParsedSamplesPage(artist_name=artist_name, items=items)
+    return ParsedSamplesPage(
+        artist_name=artist_name,
+        items=items,
+        next_page_number=_next_page_number(
+            root,
+            artist_slug=artist_slug,
+            page_number=page_number,
+        ),
+    )
 
 
-def parse_samples_page(document: str) -> ParsedSamplesPage:
+def parse_samples_page(
+    document: str,
+    *,
+    artist_slug: str | None = None,
+    page_number: int = 1,
+) -> ParsedSamplesPage:
     root = html.fromstring(document)
     main = _elements(root, "//main[@data-artist-name]")
     if not main:
-        return _live_samples_page(root)
+        return _live_samples_page(
+            root,
+            artist_slug=artist_slug,
+            page_number=page_number,
+        )
 
     artist_name = main[0].get("data-artist-name")
     if not artist_name:

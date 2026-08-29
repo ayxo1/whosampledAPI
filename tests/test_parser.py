@@ -124,20 +124,139 @@ def test_live_samples_markup_is_flattened_into_sample_uses() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fixture_name", "sampling_title"),
+    ("fixture_name", "page_number", "sampling_title", "next_page_number"),
     [
-        ("live_samples_first_page.html", "Bound 2"),
-        ("live_samples_middle_page.html", "Fight With the Best"),
-        ("live_samples_final_page.html", "Forever La Vida"),
+        ("live_samples_first_page.html", 1, "Bound 2", 2),
+        ("live_samples_middle_page.html", 40, "Fight With the Best", 41),
+        ("live_samples_final_page.html", 79, "Forever La Vida", None),
     ],
 )
 def test_sanitized_live_pagination_pages_remain_parseable(
     fixture_name: str,
+    page_number: int,
     sampling_title: str,
+    next_page_number: int | None,
 ) -> None:
     document = (FIXTURES / fixture_name).read_text(encoding="utf-8")
 
-    parsed = parse_samples_page(document)
+    parsed = parse_samples_page(
+        document,
+        artist_slug="Kanye-West",
+        page_number=page_number,
+    )
 
     assert parsed.artist_name == "Kanye West"
     assert parsed.items[0].sampling_recording.title == sampling_title
+    assert parsed.next_page_number == next_page_number
+
+
+def test_live_first_page_exposes_validated_next_samples_page() -> None:
+    document = (FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8")
+
+    parsed = parse_samples_page(
+        document,
+        artist_slug="Kanye-West",
+        page_number=1,
+    )
+
+    assert parsed.next_page_number == 2
+
+
+def test_unsafe_numbered_pagination_link_invalidates_the_whole_page() -> None:
+    document = (FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8")
+    document = document.replace(
+        'href="/Kanye-West/samples/?sp=79"',
+        'href="https://evil.example/Kanye-West/samples/?sp=79"',
+    )
+
+    with pytest.raises(ValueError, match="Invalid Samples pagination controls"):
+        parse_samples_page(
+            document,
+            artist_slug="Kanye-West",
+            page_number=1,
+        )
+
+
+def test_malformed_next_control_does_not_masquerade_as_final_page() -> None:
+    document = (FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8")
+    document = document.replace(' rel="next"', "")
+
+    with pytest.raises(ValueError, match="Invalid Samples pagination controls"):
+        parse_samples_page(
+            document,
+            artist_slug="Kanye-West",
+            page_number=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "page_number", "original_href", "unsafe_href"),
+    [
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "https://evil.example/Kanye-West/samples/?sp=2",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Jay-Z/samples/?sp=2",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Kanye-West/samples/",
+        ),
+        (
+            "live_samples_middle_page.html",
+            40,
+            "/Kanye-West/samples/?sp=41",
+            "/Kanye-West/samples/?sp=39",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Kanye-West/samples/?sp=two",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Kanye-West/samples/?sp=2&sp=3",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Kanye-West/samples/?sp=02",
+        ),
+        (
+            "live_samples_first_page.html",
+            1,
+            "/Kanye-West/samples/?sp=2",
+            "/Kanye-West/samples/?sp=\u0662",
+        ),
+    ],
+)
+def test_unsafe_next_page_destination_invalidates_the_whole_page(
+    fixture_name: str,
+    page_number: int,
+    original_href: str,
+    unsafe_href: str,
+) -> None:
+    document = (FIXTURES / fixture_name).read_text(encoding="utf-8")
+    document = document.replace(
+        f'href="{original_href}" rel="next"',
+        f'href="{unsafe_href}" rel="next"',
+    )
+
+    with pytest.raises(ValueError, match="Invalid Samples pagination controls"):
+        parse_samples_page(
+            document,
+            artist_slug="Kanye-West",
+            page_number=page_number,
+        )

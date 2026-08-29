@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from threading import Lock
 from time import monotonic, time
 from typing import Any, Protocol
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import quote
 
-BASE_URL = "https://www.whosampled.com"
+from wsmpld.samples_url import BASE_URL, resolved_samples_page_number
+
 CLEARANCE_TIMEOUT_SECONDS = 90.0
 FETCH_TIMEOUT_SECONDS = 20.0
 LOOKUP_TIMEOUT_SECONDS = 120.0
@@ -18,6 +19,13 @@ logger = logging.getLogger("uvicorn.error")
 class SamplesPage:
     html: str
     resolved_url: str
+    page_number: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.page_number is not None and (
+            type(self.page_number) is not int or self.page_number < 1
+        ):
+            raise ValueError("Resolved Samples page must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -208,14 +216,17 @@ class BrowserlessSamplesPage:
             if location is not None:
                 url = f"{url}?sp={location.page_number}"
             requested_page = location.page_number if location is not None else 1
+            page_number = requested_page
 
             def fetch_validated(current_clearance: ClearanceSession) -> BrowserlessResponse:
                 fetched = self._fetch(url, current_clearance, deadline)
-                _validate_resolved_samples_url(
+                resolved_page = _validate_resolved_samples_url(
                     fetched.resolved_url,
                     artist_slug=artist_slug,
                     requested_page=requested_page,
                 )
+                nonlocal page_number
+                page_number = resolved_page
                 return fetched
 
             response = fetch_validated(clearance)
@@ -232,7 +243,11 @@ class BrowserlessSamplesPage:
                 raise ArtistNotFoundError(artist_slug)
             if response.status_code != 200:
                 raise RuntimeError(f"Unexpected upstream status {response.status_code}")
-            return SamplesPage(html=response.text, resolved_url=response.resolved_url)
+            return SamplesPage(
+                html=response.text,
+                resolved_url=response.resolved_url,
+                page_number=page_number,
+            )
         finally:
             self._lock.release()
 
@@ -288,40 +303,15 @@ def _validate_resolved_samples_url(
     *,
     artist_slug: str,
     requested_page: int,
-) -> None:
+) -> int:
     try:
-        parsed = urlsplit(resolved_url)
-        port = parsed.port
-        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+        resolved_page = resolved_samples_page_number(resolved_url, artist_slug)
     except ValueError as error:
-        raise RuntimeError("Malformed Samples redirect destination") from error
-
-    expected_path = f"/{quote(artist_slug, safe='')}/samples/"
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname != "www.whosampled.com"
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.path != expected_path
-        or parsed.fragment
-    ):
-        raise RuntimeError("Unsafe Samples redirect destination")
-
-    if not query:
-        resolved_page = 1
-    elif len(query) == 1 and query[0][0] == "sp":
-        page_value = query[0][1]
-        if not page_value.isascii() or not page_value.isdecimal():
-            raise RuntimeError("Malformed Samples redirect page")
-        resolved_page = int(page_value)
-        if resolved_page < 2 or str(resolved_page) != page_value:
-            raise RuntimeError("Malformed Samples redirect page")
-    else:
-        raise RuntimeError("Malformed Samples redirect query")
+        raise RuntimeError("Invalid Samples redirect destination") from error
 
     if resolved_page < requested_page:
         raise RuntimeError("Samples redirect moved backward")
+    return resolved_page
 
 
 live_samples_page = BrowserlessSamplesPage(

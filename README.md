@@ -23,21 +23,34 @@ The dependencies in `pyproject.toml` are pinned to the versions used by this pro
 Start Uvicorn on the loopback interface only:
 
 ```powershell
-python -m uvicorn wsmpld.api:app --host 127.0.0.1 --port 8000
+python -m uvicorn wsmpld.api:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 The API deliberately has no authentication or CORS configuration because it is restricted to
 the local machine. Open http://127.0.0.1:8000/docs for the generated interactive documentation,
-or request a Sample Use directly:
+or start a Samples traversal directly:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/artists/Kanye-West/samples
-Invoke-RestMethod "http://127.0.0.1:8000/artists/Kanye-West/samples?limit=max"
+$page = Invoke-RestMethod "http://127.0.0.1:8000/artists/Kanye-West/samples?limit=5"
+$page.items
+$cursor = [uri]::EscapeDataString($page.pagination.next_cursor)
+$nextPage = Invoke-RestMethod "http://127.0.0.1:8000/artists/Kanye-West/samples?cursor=$cursor&limit=max"
 ```
+
+Omit `cursor` for the first request. A numeric limit can stop within the current WhoSampled page,
+while `limit=max` returns the rest of that page. Continue with `pagination.next_cursor` until it is
+null. Each request fetches at most one upstream page, and clients may change the limit between
+requests.
+
+The cursor traverses a live collection and does not create a snapshot or expire with time. If
+WhoSampled changes a page so a saved position is no longer valid, the API returns
+`409 collection_changed`; restart without a cursor. Treat cursors as opaque values and do not
+construct or edit them.
 
 The first accepted lookup can open visible Camoufox for up to 90 seconds. A complete lookup has
 a 120-second deadline. Later requests reuse unexpired clearance, and all upstream WhoSampled
-operations are serialized within the process.
+operations are serialized within the process. Run exactly one worker because clearance and
+serialization are process-local.
 
 ## Verify
 
