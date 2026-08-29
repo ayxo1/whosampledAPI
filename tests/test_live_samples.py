@@ -6,6 +6,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from itertools import pairwise
 
 import httpx
 import pytest
@@ -228,5 +229,5 @@ def test_live_small_collection_traverses_with_cursors_until_completion() -> None
     assert len(fetch_started_at) == len(responses) - 1
     assert all(
         later - earlier >= 4.0
-        for earlier, later in zip(fetch_started_at, fetch_started_at[1:], strict=True)
+        for earlier, later in pairwise(fetch_started_at)
     )
