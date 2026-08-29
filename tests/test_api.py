@@ -1,7 +1,7 @@
 import base64
 import json
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
@@ -386,6 +386,42 @@ def test_concurrent_callers_share_a_failure_without_caching_it() -> None:
     assert fetches == 2
 
 
+def test_failure_is_published_before_another_caller_can_refetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_page = SamplesPage(
+        html=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Kanye-West/samples/",
+    )
+    reentrant_responses: list[int] = []
+    fetches = 0
+    client = TestClient(app, raise_server_exceptions=False)
+
+    class PublishingFuture(Future[object]):
+        def set_exception(self, exception: BaseException) -> None:
+            super().set_exception(exception)
+            if not reentrant_responses:
+                reentrant_responses.append(
+                    client.get("/artists/Kanye-West/samples").status_code
+                )
+
+    monkeypatch.setattr("wsmpld.page_cache.Future", PublishingFuture)
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            raise RuntimeError("shared upstream failure")
+        return valid_page
+
+    with _override_samples_page(fetch):
+        failed_response = client.get("/artists/Kanye-West/samples")
+
+    assert failed_response.status_code == 502
+    assert reentrant_responses == [502]
+    assert fetches == 1
+
+
 def test_user_crosses_a_validated_page_boundary_without_an_extra_fetch() -> None:
     first_page = SamplesPage(
         html=(FIXTURES / "live_samples_first_page.html").read_text(encoding="utf-8"),
@@ -712,6 +748,17 @@ def test_forward_redirect_within_artist_samples_collection_is_accepted() -> None
     middle_page_html = (FIXTURES / "live_samples_middle_page.html").read_text(
         encoding="utf-8"
     )
+    track_start = middle_page_html.index('      <section class="trackItem"')
+    track_end = middle_page_html.index("      </section>", track_start) + len(
+        "      </section>"
+    )
+    track_markup = middle_page_html[track_start:track_end]
+    middle_page_html = (
+        middle_page_html[:track_end]
+        + "\n"
+        + track_markup
+        + middle_page_html[track_end:]
+    )
     middle_page_html = middle_page_html.replace("?sp=41", "?sp=42").replace(
         '<span class="curr">40</span>',
         '<span class="curr">41</span>',
@@ -728,7 +775,7 @@ def test_forward_redirect_within_artist_samples_collection_is_accepted() -> None
         timeout: float,
     ) -> BrowserlessResponse:
         requested_urls.append(url)
-        if url.endswith("?sp=40"):
+        if url.endswith(("?sp=40", "?sp=41")):
             return BrowserlessResponse(
                 status_code=200,
                 text=middle_page_html,
@@ -749,15 +796,21 @@ def test_forward_redirect_within_artist_samples_collection_is_accepted() -> None
     with _override_samples_page(page_fetch):
         redirected_response = client.get(
             "/artists/Kanye-West/samples",
-            params={"cursor": cursor, "limit": "max"},
+            params={"cursor": cursor, "limit": 1},
         )
-        next_cursor = redirected_response.json()["pagination"]["next_cursor"]
+        same_page_cursor = redirected_response.json()["pagination"]["next_cursor"]
+        cached_response = client.get(
+            "/artists/Kanye-West/samples",
+            params={"cursor": same_page_cursor, "limit": "max"},
+        )
+        next_cursor = cached_response.json()["pagination"]["next_cursor"]
         final_response = client.get(
             "/artists/Kanye-West/samples",
             params={"cursor": next_cursor, "limit": "max"},
         )
 
     assert redirected_response.status_code == 200
+    assert cached_response.status_code == 200
     assert redirected_response.json()["artist"]["samples_url"] == (
         "https://www.whosampled.com/Kanye-West/samples/"
     )

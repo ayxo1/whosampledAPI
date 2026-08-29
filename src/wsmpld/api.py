@@ -176,7 +176,6 @@ def read_samples(
         raise _upstream_invalid() from error
     page = cached_page.source
     parsed = cached_page.parsed
-    resolved_page_number = page.page_number or page_number
     logger.info("parsed %d Sample Uses artist_slug=%s", len(parsed.items), artist_slug)
     offset = position.item_offset if position is not None else 0
     if offset > 0 and offset >= len(parsed.items):
@@ -188,7 +187,7 @@ def read_samples(
     if next_offset < len(parsed.items):
         next_position = CursorPosition(
             artist_slug=artist_slug,
-            page_number=resolved_page_number,
+            page_number=page_number,
             item_offset=next_offset,
         )
     elif parsed.next_page_number is not None:

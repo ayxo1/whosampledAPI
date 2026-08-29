@@ -104,9 +104,9 @@ class ParsedSamplesPageCache:
             )
             cached = CachedSamplesPage(source=source, parsed=parsed)
         except BaseException as error:
+            pending.set_exception(error)
             with self._lock:
                 del self._inflight[key]
-            pending.set_exception(error)
             raise
 
         with self._lock:
