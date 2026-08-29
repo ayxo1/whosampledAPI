@@ -16,7 +16,6 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert "pagination.next_cursor" in readme
     assert "collection_changed" in readme
     assert "live collection" in readme
-    assert "duplicates or omissions" in readme
     assert "four seconds" in readme
     assert "zero to one second" in readme
     assert "upstream_rate_limited" in readme

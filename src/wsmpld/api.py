@@ -43,7 +43,7 @@ INVALID_CURSOR_DETAIL = {
 }
 COLLECTION_CHANGED_DETAIL = {
     "code": "collection_changed",
-    "message": "The live Samples collection changed; restart without a cursor.",
+    "message": "The live Samples collection changed; restart the traversal.",
 }
 UPSTREAM_RATE_LIMITED_DETAIL = {
     "code": "upstream_rate_limited",

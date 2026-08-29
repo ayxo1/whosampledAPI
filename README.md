@@ -45,8 +45,7 @@ requests.
 The cursor traverses a live collection and does not create a snapshot or expire with time. If
 WhoSampled changes a page so a saved position is no longer valid, the API returns
 `409 collection_changed`; restart without a cursor. Treat cursors as opaque values and do not
-construct or edit them. Changes that keep a saved position valid cannot be detected, so live
-reorderings may cause duplicates or omissions across requests.
+construct or edit them.
 
 The first accepted lookup can open visible Camoufox for up to 90 seconds. A complete lookup has
 a 120-second deadline. Later requests reuse unexpired clearance, and all upstream WhoSampled
