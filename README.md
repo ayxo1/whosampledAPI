@@ -52,6 +52,11 @@ stays `Bound 2`; the Source Recording changes.
 
 The response has three parts:
 
+`GET /sample-uses/{sample_use_id}` retrieves one direct Sample Use by its positive numeric
+WhoSampled ID. The response identifies the Sampling Recording and Source Material separately.
+Deleted relationships return a stable not-found response, while interpolations and other
+non-direct connections return a stable unsupported-connection response.
+
 | Field | Meaning |
 |---|---|
 | `artist` | The requested slug, parsed artist name, and canonical Samples URL. |
@@ -169,6 +174,8 @@ Errors use a stable `detail.code` and `detail.message` response body.
 |---|---|---|
 | `400 invalid_cursor` | The cursor is malformed, unsupported, impossible, or bound to another artist. | Restart without a cursor. |
 | `404 artist_not_found` | WhoSampled did not find the exact artist slug. | Check the slug and its capitalization. |
+| `404 sample_use_not_found` | WhoSampled no longer has the requested Sample Use. | Record the missing observation and do not retry unchanged input. |
+| `422 unsupported_connection_type` | The relationship is not a direct Sample Use. | Exclude it from direct-audio collection. |
 | `409 collection_changed` | Live data invalidated the saved item position. | Discard the cursor and restart the traversal. |
 | `502 upstream_invalid` | WhoSampled returned invalid markup, status, or redirect data. | Stop and inspect the server logs. |
 | `503 clearance_failed` | Camoufox could not acquire or refresh a reusable session. | Retry after clearance can run successfully. |

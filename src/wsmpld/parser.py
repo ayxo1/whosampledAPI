@@ -18,6 +18,10 @@ from wsmpld.samples_url import BASE_URL, samples_page_link_number
 SAMPLES_PARSER_VERSION = "1"
 
 
+class UnsupportedConnectionTypeError(ValueError):
+    """The detail page identifies a relationship other than a direct Sample Use."""
+
+
 @dataclass(frozen=True)
 class ParsedSamplesPage:
     artist_name: str
@@ -129,15 +133,46 @@ def _detail_work(root: html.HtmlElement, container_id: str) -> tuple[str, HttpUr
     return title, HttpUrl(urljoin(BASE_URL, href))
 
 
-def parse_sample_use_detail(document: str) -> ParsedSampleUseDetail:
-    root = html.fromstring(document)
-    headings = _elements(
+def _detail_sample_use_id(root: html.HtmlElement) -> int:
+    canonical_links = _elements(
         root,
-        f"//h2[{_xpath_has_class('section-header-title')}][starts-with(normalize-space(), "
-        "'Direct Sample of ')]",
+        "//link[contains(concat(' ', normalize-space(@rel), ' '), ' canonical ')][@href]",
     )
-    if len(headings) != 1:
-        raise ValueError("Sample Use is not a direct sample")
+    if len(canonical_links) != 1:
+        raise ValueError("Missing canonical Sample Use identity")
+    href = canonical_links[0].get("href")
+    if href is None:
+        raise ValueError("Missing canonical Sample Use identity")
+    parsed = urlsplit(href)
+    match = re.fullmatch(r"/sample/([1-9][0-9]*)/[^/]+/", parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "www.whosampled.com"
+        or parsed.query
+        or parsed.fragment
+        or match is None
+    ):
+        raise ValueError("Malformed canonical Sample Use identity")
+    return int(match.group(1))
+
+
+def parse_sample_use_detail(
+    document: str,
+    *,
+    sample_use_id: int,
+) -> ParsedSampleUseDetail:
+    root = html.fromstring(document)
+    if _detail_sample_use_id(root) != sample_use_id:
+        raise ValueError("Canonical Sample Use identity does not match the request")
+    relationship_headings = _elements(
+        root,
+        f"//h2[{_xpath_has_class('section-header-title')}]",
+    )
+    heading_texts = [" ".join(heading.text_content().split()) for heading in relationship_headings]
+    if len(heading_texts) != 1:
+        raise ValueError("Sample Use relationship heading is malformed")
+    if not heading_texts[0].startswith("Direct Sample of "):
+        raise UnsupportedConnectionTypeError("Sample Use connection type is unsupported")
     sampling_title, sampling_url = _detail_work(root, "sampleWrap_dest")
     source_title, source_url = _detail_work(root, "sampleWrap_source")
     return ParsedSampleUseDetail(

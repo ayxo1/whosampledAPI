@@ -19,6 +19,7 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     )
     assert "http://127.0.0.1:8000/docs" in readme
     assert "GET /artists/{artist_slug}/samples" in readme
+    assert "GET /sample-uses/{sample_use_id}" in readme
     assert "Try it out" in readme
     assert "exact, case-sensitive" in readme
     assert "one Sample Use for each Source Recording" in readme
@@ -42,6 +43,8 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert "400 invalid_cursor" in readme
     assert "503 upstream_rate_limited" in readme
     assert "404 artist_not_found" in readme
+    assert "404 sample_use_not_found" in readme
+    assert "422 unsupported_connection_type" in readme
     assert "502 upstream_invalid" in readme
     assert "504 lookup_timeout" in readme
     assert "while ($true)" in readme

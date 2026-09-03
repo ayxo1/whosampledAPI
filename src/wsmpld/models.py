@@ -135,6 +135,8 @@ class ErrorDetail(BaseModel):
         "invalid_cursor",
         "collection_changed",
         "upstream_rate_limited",
+        "sample_use_not_found",
+        "unsupported_connection_type",
     ]
     message: str
 

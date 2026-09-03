@@ -127,6 +127,10 @@ class ArtistNotFoundError(Exception):
     """The upstream definitively reported that the requested artist does not exist."""
 
 
+class SampleUseNotFoundError(Exception):
+    """The upstream definitively reported that the requested Sample Use does not exist."""
+
+
 class ClearanceFailedError(Exception):
     """A reusable upstream clearance session could not be acquired."""
 
@@ -503,6 +507,8 @@ class BrowserlessSampleUsePage:
             validate_response=validate_response,
             resource_name="Sample Use",
         )
+        if response.status_code == 404:
+            raise SampleUseNotFoundError(sample_use_id)
         if response.status_code != 200:
             raise RuntimeError(f"Unexpected upstream status {response.status_code}")
         return SampleUsePage(

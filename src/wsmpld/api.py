@@ -1,11 +1,12 @@
 import logging
+import re
 from hashlib import sha256
 from typing import Annotated, Literal
 from unicodedata import normalize
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query
-from pydantic import AfterValidator, Field, HttpUrl, ValidationError
+from pydantic import AfterValidator, BeforeValidator, Field, HttpUrl, ValidationError
 
 from wsmpld.cursor import CursorPosition, InvalidCursorError, decode_cursor, encode_cursor
 from wsmpld.models import (
@@ -17,7 +18,11 @@ from wsmpld.models import (
     SampleUseDetailResponse,
 )
 from wsmpld.page_cache import ParsedSamplesPageCache
-from wsmpld.parser import SAMPLES_PARSER_VERSION, parse_sample_use_detail
+from wsmpld.parser import (
+    SAMPLES_PARSER_VERSION,
+    UnsupportedConnectionTypeError,
+    parse_sample_use_detail,
+)
 from wsmpld.upstream import (
     ArtistNotFoundError,
     ClearanceFailedError,
@@ -25,6 +30,7 @@ from wsmpld.upstream import (
     FetchSampleUsePage,
     LookupTimeoutError,
     SamplesPageLocation,
+    SampleUseNotFoundError,
     UpstreamRateLimitedError,
     live_sample_use_page,
     live_samples_page,
@@ -60,6 +66,14 @@ UPSTREAM_RATE_LIMITED_DETAIL = {
     "code": "upstream_rate_limited",
     "message": "WhoSampled rate limited the request.",
 }
+SAMPLE_USE_NOT_FOUND_DETAIL = {
+    "code": "sample_use_not_found",
+    "message": "Sample Use was not found.",
+}
+UNSUPPORTED_CONNECTION_TYPE_DETAIL = {
+    "code": "unsupported_connection_type",
+    "message": "Only direct Sample Uses are supported.",
+}
 
 
 def _validate_artist_slug(value: str) -> str:
@@ -86,6 +100,12 @@ ArtistSlug = Annotated[
 ]
 
 
+def _validate_sample_use_id(value: object) -> object:
+    if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise ValueError("Sample Use ID must use canonical positive-integer syntax")
+    return value
+
+
 def get_samples_page() -> FetchSamplesPage:
     return live_samples_page
 
@@ -103,6 +123,15 @@ def get_samples_page_cache() -> ParsedSamplesPageCache:
 
 def _upstream_invalid() -> HTTPException:
     return HTTPException(status_code=502, detail=UPSTREAM_INVALID_DETAIL)
+
+
+def _upstream_rate_limited(error: UpstreamRateLimitedError) -> HTTPException:
+    headers = {"Retry-After": error.retry_after} if error.retry_after is not None else None
+    return HTTPException(
+        status_code=503,
+        detail=UPSTREAM_RATE_LIMITED_DETAIL,
+        headers=headers,
+    )
 
 
 def _documented_error(description: str, detail: dict[str, str]) -> dict[str, object]:
@@ -142,6 +171,45 @@ def _documented_service_unavailable() -> dict[str, object]:
     }
 
 
+def _documented_sample_use_unprocessable() -> dict[str, object]:
+    return {
+        "description": "The Sample Use ID was invalid or the relationship is unsupported.",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/ErrorResponse"},
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                    ]
+                },
+                "examples": {
+                    "unsupported_connection_type": {
+                        "summary": "The relationship is not a direct Sample Use",
+                        "value": {"detail": UNSUPPORTED_CONNECTION_TYPE_DETAIL},
+                    },
+                    "validation_error": {
+                        "summary": "The path value is not a canonical positive integer",
+                        "value": {
+                            "detail": [
+                                {
+                                    "type": "value_error",
+                                    "loc": ["path", "sample_use_id"],
+                                    "msg": (
+                                        "Value error, Sample Use ID must use canonical "
+                                        "positive-integer syntax"
+                                    ),
+                                    "input": "01",
+                                    "ctx": {"error": {}},
+                                }
+                            ]
+                        },
+                    },
+                },
+            }
+        },
+    }
+
+
 def _samples_collection_url(resolved_url: str) -> HttpUrl:
     parsed = urlsplit(resolved_url)
     return HttpUrl(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
@@ -156,6 +224,13 @@ app = FastAPI(
 @app.get(
     "/sample-uses/{sample_use_id}",
     response_model=SampleUseDetailResponse,
+    responses={
+        404: _documented_error("Sample Use was not found.", SAMPLE_USE_NOT_FOUND_DETAIL),
+        422: _documented_sample_use_unprocessable(),
+        502: _documented_error("WhoSampled response was invalid.", UPSTREAM_INVALID_DETAIL),
+        503: _documented_service_unavailable(),
+        504: _documented_error("Complete lookup timed out.", LOOKUP_TIMEOUT_DETAIL),
+    },
     summary="Get one direct Sample Use",
     description=(
         "Retrieve the core Sampling Recording and Source Material for one direct "
@@ -165,18 +240,20 @@ app = FastAPI(
 def read_sample_use(
     sample_use_id: Annotated[
         int,
+        BeforeValidator(_validate_sample_use_id),
         Path(
-            gt=0,
             title="WhoSampled Sample Use ID",
             description="A positive numeric WhoSampled Sample Use ID.",
+            json_schema_extra={"exclusiveMinimum": 0},
         ),
     ],
     fetch_sample_use_page: Annotated[FetchSampleUsePage, Depends(get_sample_use_page)],
 ) -> SampleUseDetailResponse:
+    logger.info("Sample Use lookup started")
     try:
         page = fetch_sample_use_page(sample_use_id)
-        parsed = parse_sample_use_detail(page.html)
-        return SampleUseDetailResponse(
+        parsed = parse_sample_use_detail(page.html, sample_use_id=sample_use_id)
+        response = SampleUseDetailResponse(
             schema_version=1,
             sample_use_id=sample_use_id,
             sample_use_url=HttpUrl(page.resolved_url),
@@ -184,7 +261,38 @@ def read_sample_use(
             sampling_recording=parsed.sampling_recording,
             source_material=parsed.source_material,
         )
+        logger.info("Sample Use lookup completed")
+        return response
+    except SampleUseNotFoundError as error:
+        logger.info("Sample Use lookup failed code=sample_use_not_found")
+        raise HTTPException(status_code=404, detail=SAMPLE_USE_NOT_FOUND_DETAIL) from error
+    except UnsupportedConnectionTypeError as error:
+        logger.info("Sample Use lookup failed code=unsupported_connection_type")
+        raise HTTPException(
+            status_code=422,
+            detail=UNSUPPORTED_CONNECTION_TYPE_DETAIL,
+        ) from error
+    except ClearanceFailedError as error:
+        logger.info("Sample Use lookup failed code=clearance_failed")
+        raise HTTPException(status_code=503, detail=CLEARANCE_FAILED_DETAIL) from error
+    except UpstreamRateLimitedError as error:
+        logger.info(
+            "Sample Use lookup failed code=upstream_rate_limited "
+            "retry_after_forwarded=%s",
+            error.retry_after is not None,
+        )
+        raise _upstream_rate_limited(error) from error
+    except LookupTimeoutError as error:
+        logger.info("Sample Use lookup failed code=lookup_timeout")
+        raise HTTPException(status_code=504, detail=LOOKUP_TIMEOUT_DETAIL) from error
     except (ValidationError, ValueError) as error:
+        logger.warning("Sample Use lookup failed code=upstream_invalid")
+        raise _upstream_invalid() from error
+    except Exception as error:
+        logger.warning(
+            "Sample Use lookup failed code=upstream_invalid error_type=%s",
+            type(error).__name__,
+        )
         raise _upstream_invalid() from error
 
 
@@ -256,12 +364,7 @@ def read_samples(
             error.retry_after is not None,
             artist_slug,
         )
-        headers = {"Retry-After": error.retry_after} if error.retry_after is not None else None
-        raise HTTPException(
-            status_code=503,
-            detail=UPSTREAM_RATE_LIMITED_DETAIL,
-            headers=headers,
-        ) from error
+        raise _upstream_rate_limited(error) from error
     except LookupTimeoutError as error:
         logger.info("Samples lookup timed out artist_slug=%s", artist_slug)
         raise HTTPException(status_code=504, detail=LOOKUP_TIMEOUT_DETAIL) from error
