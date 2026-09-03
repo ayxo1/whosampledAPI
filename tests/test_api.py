@@ -6,6 +6,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock
+from typing import Any
 from urllib.parse import quote
 
 import pytest
@@ -54,7 +55,7 @@ def _override_samples_page(
 
 
 def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSamplesPage:
-    return BrowserlessSamplesPage(
+    return _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -66,6 +67,12 @@ def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSam
         minimum_interval_seconds=0.0,
         minimum_jitter_seconds=0.0,
         maximum_jitter_seconds=0.0,
+    )
+
+
+def _browserless_samples_page(**session_options: Any) -> BrowserlessSamplesPage:
+    return BrowserlessSamplesPage(
+        session=BrowserlessWhoSampledSession(**session_options)
     )
 
 
@@ -132,7 +139,7 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
         fetch_times.append(current_time)
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -168,7 +175,7 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
     ]
 
 
-def test_artist_and_future_resource_share_clearance_session_and_pacing() -> None:
+def test_samples_and_sample_use_share_clearance_session_and_pacing() -> None:
     page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
     current_time = 0.0
     acquisitions = 0
@@ -200,26 +207,26 @@ def test_artist_and_future_resource_share_clearance_session_and_pacing() -> None
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
         sleep=sleep,
-        jitter=lambda lower, upper: 0.0,
+        jitter=lambda lower, upper: 0.25,
     )
     fetch_samples_page = BrowserlessSamplesPage(session=session)
 
     with _override_samples_page(fetch_samples_page):
         artist_response = TestClient(app).get("/artists/Kanye-West/samples")
-        resource_response = session.fetch(
+        sample_use_response = session.fetch(
             "https://www.whosampled.com/sample/123/",
             validate_response=lambda response: None,
             resource_name="Sample Use",
         )
 
     assert artist_response.status_code == 200
-    assert resource_response.status_code == 200
+    assert sample_use_response.status_code == 200
     assert acquisitions == 1
     assert requested_urls == [
         "https://www.whosampled.com/Kanye-West/samples/",
         "https://www.whosampled.com/sample/123/",
     ]
-    assert sleeps == [4.0]
+    assert sleeps == [4.25]
 
 
 def test_cache_hit_returns_without_pacing_or_an_upstream_request(
@@ -246,7 +253,7 @@ def test_cache_hit_returns_without_pacing_or_an_upstream_request(
         jitter_calls += 1
         return 0.0
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -304,7 +311,7 @@ def test_upstream_rate_limit_returns_stable_service_unavailable_without_retry(
             headers={"Retry-After": "120", "X-Secret": "do-not-log-header"},
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1051,7 +1058,7 @@ def test_page_fetch_boundary_rejects_arbitrary_url_before_upstream_work() -> Non
         fetches += 1
         raise AssertionError("fetch must not run for an arbitrary location")
 
-    page_fetch = BrowserlessSamplesPage(
+    page_fetch = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1254,7 +1261,7 @@ def test_unsafe_destination_is_rejected_before_status_or_challenge_mapping(
             resolved_url="https://evil.example/Kanye-West/samples/",
         )
 
-    page_fetch = BrowserlessSamplesPage(
+    page_fetch = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1678,7 +1685,7 @@ def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1726,7 +1733,7 @@ def test_sequential_requests_reuse_unexpired_clearance(
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1780,7 +1787,7 @@ def test_expired_clearance_is_discarded_before_next_request(
         fetches += 1
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1845,7 +1852,7 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1894,7 +1901,7 @@ def test_second_browserless_challenge_fails_without_browser_fallback() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1936,7 +1943,7 @@ def test_challenge_retry_pacing_stops_at_the_complete_lookup_deadline() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -1973,7 +1980,7 @@ def test_clearance_acquisition_exception_has_stable_service_unavailable_response
         fetches += 1
         raise AssertionError("browserless fetch must not run without clearance")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -2007,7 +2014,7 @@ def test_complete_operation_budget_stops_work_before_browserless_fetch() -> None
         fetches += 1
         raise AssertionError("fetch must not start after the complete deadline")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 121.0 if acquisition_completed else 0.0,
@@ -2035,7 +2042,7 @@ def test_complete_operation_budget_expires_before_clearance_acquisition() -> Non
         acquisitions += 1
         raise AssertionError("acquisition must not start after the complete deadline")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
             status_code=500,
@@ -2061,7 +2068,7 @@ def test_clearance_timeout_at_complete_deadline_is_lookup_timeout() -> None:
         deadline_expired = True
         raise TimeoutError(f"clearance timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
             status_code=500,
@@ -2088,7 +2095,7 @@ def test_browserless_timeout_at_complete_deadline_is_lookup_timeout() -> None:
         deadline_expired = True
         raise TimeoutError(f"fetch timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -2111,7 +2118,7 @@ def test_individual_browserless_timeout_before_complete_deadline_is_upstream_inv
     ) -> BrowserlessResponse:
         raise TimeoutError(f"fetch timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
             user_agent="test-agent",
@@ -2165,7 +2172,7 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -2211,7 +2218,7 @@ def test_lifecycle_logs_report_acquisition_browserless_fetch_and_parse_count(
     ) -> BrowserlessResponse:
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,

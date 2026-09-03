@@ -377,37 +377,9 @@ class BrowserlessSamplesPage:
     def __init__(
         self,
         *,
-        session: BrowserlessWhoSampledSession | None = None,
-        acquire_clearance: AcquireClearance | None = None,
-        fetch_browserlessly: FetchBrowserlessly | None = None,
-        monotonic: Callable[[], float] = monotonic,
-        sleep: Callable[[float], None] = sleep,
-        jitter: Callable[[float, float], float] = random.uniform,
-        minimum_interval_seconds: float = MINIMUM_REQUEST_INTERVAL_SECONDS,
-        minimum_jitter_seconds: float = MINIMUM_REQUEST_JITTER_SECONDS,
-        maximum_jitter_seconds: float = MAXIMUM_REQUEST_JITTER_SECONDS,
+        session: BrowserlessWhoSampledSession,
     ) -> None:
-        if session is not None:
-            if acquire_clearance is not None or fetch_browserlessly is not None:
-                raise TypeError(
-                    "session cannot be combined with clearance or browserless fetch dependencies"
-                )
-            self._session = session
-            return
-        if acquire_clearance is None or fetch_browserlessly is None:
-            raise TypeError(
-                "acquire_clearance and fetch_browserlessly are required without a session"
-            )
-        self._session = BrowserlessWhoSampledSession(
-            acquire_clearance=acquire_clearance,
-            fetch_browserlessly=fetch_browserlessly,
-            monotonic=monotonic,
-            sleep=sleep,
-            jitter=jitter,
-            minimum_interval_seconds=minimum_interval_seconds,
-            minimum_jitter_seconds=minimum_jitter_seconds,
-            maximum_jitter_seconds=maximum_jitter_seconds,
-        )
+        self._session = session
 
     def __call__(
         self,
