@@ -1,11 +1,14 @@
 import base64
 import json
+import sys
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
+from typing import Any
 from urllib.parse import quote
 
 import pytest
@@ -18,6 +21,8 @@ from wsmpld.upstream import (
     ArtistNotFoundError,
     BrowserlessResponse,
     BrowserlessSamplesPage,
+    BrowserlessWhoSampledSession,
+    CamoufoxClearanceAcquirer,
     ClearanceFailedError,
     ClearanceSession,
     FetchBrowserlessly,
@@ -28,6 +33,10 @@ from wsmpld.upstream import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+FIREFOX_135_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
+    "Gecko/20100101 Firefox/135.0"
+)
 
 
 def _opaque_cursor_payload(payload: object) -> str:
@@ -53,10 +62,10 @@ def _override_samples_page(
 
 
 def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSamplesPage:
-    return BrowserlessSamplesPage(
+    return _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -65,6 +74,12 @@ def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSam
         minimum_interval_seconds=0.0,
         minimum_jitter_seconds=0.0,
         maximum_jitter_seconds=0.0,
+    )
+
+
+def _browserless_samples_page(**session_options: Any) -> BrowserlessSamplesPage:
+    return BrowserlessSamplesPage(
+        session=BrowserlessWhoSampledSession(**session_options)
     )
 
 
@@ -131,10 +146,10 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
         fetch_times.append(current_time)
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -167,6 +182,60 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
     ]
 
 
+def test_samples_and_sample_use_share_clearance_session_and_pacing() -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    current_time = 0.0
+    acquisitions = 0
+    requested_urls: list[str] = []
+    sleeps: list[float] = []
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent=FIREFOX_135_USER_AGENT,
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        requested_urls.append(url)
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
+    session = BrowserlessWhoSampledSession(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.25,
+    )
+    fetch_samples_page = BrowserlessSamplesPage(session=session)
+
+    with _override_samples_page(fetch_samples_page):
+        artist_response = TestClient(app).get("/artists/Kanye-West/samples")
+        sample_use_response = session.fetch(
+            "https://www.whosampled.com/sample/123/",
+            validate_response=lambda response: None,
+            resource_name="Sample Use",
+        )
+
+    assert artist_response.status_code == 200
+    assert sample_use_response.status_code == 200
+    assert acquisitions == 1
+    assert requested_urls == [
+        "https://www.whosampled.com/Kanye-West/samples/",
+        "https://www.whosampled.com/sample/123/",
+    ]
+    assert sleeps == [4.25]
+
+
 def test_cache_hit_returns_without_pacing_or_an_upstream_request(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -191,10 +260,10 @@ def test_cache_hit_returns_without_pacing_or_an_upstream_request(
         jitter_calls += 1
         return 0.0
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -233,7 +302,7 @@ def test_upstream_rate_limit_returns_stable_service_unavailable_without_retry(
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -249,7 +318,7 @@ def test_upstream_rate_limit_returns_stable_service_unavailable_without_retry(
             headers={"Retry-After": "120", "X-Secret": "do-not-log-header"},
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -996,7 +1065,7 @@ def test_page_fetch_boundary_rejects_arbitrary_url_before_upstream_work() -> Non
         fetches += 1
         raise AssertionError("fetch must not run for an arbitrary location")
 
-    page_fetch = BrowserlessSamplesPage(
+    page_fetch = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1184,7 +1253,7 @@ def test_unsafe_destination_is_rejected_before_status_or_challenge_mapping(
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -1199,7 +1268,7 @@ def test_unsafe_destination_is_rejected_before_status_or_challenge_mapping(
             resolved_url="https://evil.example/Kanye-West/samples/",
         )
 
-    page_fetch = BrowserlessSamplesPage(
+    page_fetch = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1578,6 +1647,141 @@ def test_clearance_failure_has_stable_service_unavailable_response() -> None:
     }
 
 
+def test_incompatible_clearance_fingerprint_fails_before_browserless_fetch() -> None:
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        return ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) "
+                "Gecko/20100101 Firefox/152.0"
+            ),
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=200,
+            text=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+            resolved_url=url,
+        )
+
+    fetch_samples_page = _browserless_samples_page(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+    )
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "clearance_failed"
+    assert fetches == 0
+
+
+def test_clearance_waits_for_usable_who_sampled_page_before_fetching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetches = 0
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.context = self
+            self.frames: list[object] = []
+            self.ready = False
+            self.url = "https://www.whosampled.com/"
+            self.waits = 0
+
+        def goto(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def cookies(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "name": "cf_clearance",
+                    "value": "secret",
+                    "expires": -1,
+                }
+            ]
+
+        def content(self) -> str:
+            if not self.ready:
+                return "<html><title>Just a moment...</title></html>"
+            return "<html><title>WhoSampled</title></html>"
+
+        def evaluate(self, expression: str) -> str:
+            return FIREFOX_135_USER_AGENT
+
+        def wait_for_timeout(self, milliseconds: int) -> None:
+            self.waits += 1
+            self.ready = True
+
+    pages: list[FakePage] = []
+
+    class FakeBrowser:
+        def __enter__(self) -> "FakeBrowser":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def new_page(self) -> FakePage:
+            page = FakePage()
+            pages.append(page)
+            return page
+
+    monkeypatch.setitem(
+        sys.modules,
+        "camoufox.sync_api",
+        SimpleNamespace(Camoufox=lambda **kwargs: FakeBrowser()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.sync_api",
+        SimpleNamespace(Error=RuntimeError),
+    )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        challenged = not pages[-1].ready
+        return BrowserlessResponse(
+            status_code=403 if challenged else 200,
+            text=(
+                "<title>Just a moment...</title>"
+                if challenged
+                else (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+            ),
+            resolved_url=url,
+        )
+
+    fetch_samples_page = _browserless_samples_page(
+        acquire_clearance=CamoufoxClearanceAcquirer(),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 200
+    assert fetches == 1
+    assert len(pages) == 1
+    assert pages[0].waits >= 1
+
+
 def test_complete_lookup_timeout_has_stable_gateway_timeout_response(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1609,7 +1813,7 @@ def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
         events.append(f"acquire:{timeout}")
         return ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -1623,7 +1827,7 @@ def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1637,7 +1841,7 @@ def test_clearance_is_acquired_lazily_on_first_accepted_lookup() -> None:
     assert response.status_code == 200
     assert events == [
         "acquire:90.0",
-        "fetch:https://www.whosampled.com/Kanye-West/samples/:test-agent:20.0",
+        f"fetch:https://www.whosampled.com/Kanye-West/samples/:{FIREFOX_135_USER_AGENT}:20.0",
     ]
 
 
@@ -1655,7 +1859,7 @@ def test_sequential_requests_reuse_unexpired_clearance(
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": "do-not-log-this-secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -1671,7 +1875,7 @@ def test_sequential_requests_reuse_unexpired_clearance(
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1714,7 +1918,7 @@ def test_expired_clearance_is_discarded_before_next_request(
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": f"do-not-log-secret-{acquisitions}"},
-            user_agent=f"test-agent-{acquisitions}",
+            user_agent=f"{FIREFOX_135_USER_AGENT} acquisition-{acquisitions}",
             expires_at=current_time + 10.0,
         )
 
@@ -1725,7 +1929,7 @@ def test_expired_clearance_is_discarded_before_next_request(
         fetches += 1
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1765,7 +1969,7 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
         events.append("acquire")
         return ClearanceSession(
             cookies={"cf_clearance": f"secret-{acquisitions}"},
-            user_agent=f"test-agent-{acquisitions}",
+            user_agent=f"{FIREFOX_135_USER_AGENT} acquisition-{acquisitions}",
             expires_at=10_000.0,
         )
 
@@ -1790,7 +1994,7 @@ def test_challenged_browserless_fetch_refreshes_clearance_once_and_retries(
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -1824,7 +2028,7 @@ def test_second_browserless_challenge_fails_without_browser_fallback() -> None:
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": f"secret-{acquisitions}"},
-            user_agent=f"test-agent-{acquisitions}",
+            user_agent=f"{FIREFOX_135_USER_AGENT} acquisition-{acquisitions}",
             expires_at=10_000.0,
         )
 
@@ -1839,7 +2043,7 @@ def test_second_browserless_challenge_fails_without_browser_fallback() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1881,10 +2085,10 @@ def test_challenge_retry_pacing_stops_at_the_complete_lookup_deadline() -> None:
             resolved_url=url,
         )
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -1918,7 +2122,7 @@ def test_clearance_acquisition_exception_has_stable_service_unavailable_response
         fetches += 1
         raise AssertionError("browserless fetch must not run without clearance")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
@@ -1941,7 +2145,7 @@ def test_complete_operation_budget_stops_work_before_browserless_fetch() -> None
         acquisition_completed = True
         return ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -1952,7 +2156,7 @@ def test_complete_operation_budget_stops_work_before_browserless_fetch() -> None
         fetches += 1
         raise AssertionError("fetch must not start after the complete deadline")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 121.0 if acquisition_completed else 0.0,
@@ -1980,7 +2184,7 @@ def test_complete_operation_budget_expires_before_clearance_acquisition() -> Non
         acquisitions += 1
         raise AssertionError("acquisition must not start after the complete deadline")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
             status_code=500,
@@ -2006,7 +2210,7 @@ def test_clearance_timeout_at_complete_deadline_is_lookup_timeout() -> None:
         deadline_expired = True
         raise TimeoutError(f"clearance timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
             status_code=500,
@@ -2033,10 +2237,10 @@ def test_browserless_timeout_at_complete_deadline_is_lookup_timeout() -> None:
         deadline_expired = True
         raise TimeoutError(f"fetch timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -2056,10 +2260,10 @@ def test_individual_browserless_timeout_before_complete_deadline_is_upstream_inv
     ) -> BrowserlessResponse:
         raise TimeoutError(f"fetch timed out after {timeout} seconds")
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         ),
         fetch_browserlessly=fetch_browserlessly,
@@ -2088,7 +2292,7 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
         acquisitions += 1
         return ClearanceSession(
             cookies={"cf_clearance": "secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -2110,7 +2314,7 @@ def test_concurrent_requests_serialize_browserless_fetches() -> None:
         sleeps.append(delay)
         current_time += delay
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: current_time,
@@ -2147,7 +2351,7 @@ def test_lifecycle_logs_report_acquisition_browserless_fetch_and_parse_count(
     def acquire_clearance(timeout: float) -> ClearanceSession:
         return ClearanceSession(
             cookies={"cf_clearance": "do-not-log-this-secret"},
-            user_agent="test-agent",
+            user_agent=FIREFOX_135_USER_AGENT,
             expires_at=10_000.0,
         )
 
@@ -2156,7 +2360,7 @@ def test_lifecycle_logs_report_acquisition_browserless_fetch_and_parse_count(
     ) -> BrowserlessResponse:
         return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
 
-    fetch_samples_page = BrowserlessSamplesPage(
+    fetch_samples_page = _browserless_samples_page(
         acquire_clearance=acquire_clearance,
         fetch_browserlessly=fetch_browserlessly,
         monotonic=lambda: 0.0,
