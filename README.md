@@ -13,10 +13,14 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+python -m camoufox set official/stable/135.0.1-beta.24
 python -m camoufox fetch
 ```
 
-The dependencies in `pyproject.toml` are pinned to the versions used by this project.
+The dependencies in `pyproject.toml` and the Camoufox browser command above are pinned to the
+versions used by this project. The browser pin must remain aligned with the `firefox135`
+fingerprint used by `curl_cffi`; a different browser major version fails clearance acquisition
+before a browserless request.
 
 ## Run locally
 

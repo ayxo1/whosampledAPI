@@ -7,6 +7,10 @@ def test_readme_documents_the_complete_local_workflow() -> None:
     assert "Python 3.13" in readme
     assert "python -m venv .venv" in readme
     assert 'python -m pip install -e ".[dev]"' in readme
+    assert (
+        "python -m camoufox set official/stable/135.0.1-beta.24"
+        in readme
+    )
     assert "python -m camoufox fetch" in readme
     assert (
         "python -m uvicorn wsmpld.api:app --host 127.0.0.1 --port 8000 --workers 1 "

@@ -7,7 +7,7 @@ from email.utils import parsedate_to_datetime
 from threading import Lock
 from time import monotonic, sleep, time
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from wsmpld.samples_url import BASE_URL, resolved_samples_page_number
 
@@ -17,6 +17,9 @@ LOOKUP_TIMEOUT_SECONDS = 120.0
 MINIMUM_REQUEST_INTERVAL_SECONDS = 4.0
 MINIMUM_REQUEST_JITTER_SECONDS = 0.0
 MAXIMUM_REQUEST_JITTER_SECONDS = 1.0
+CURL_CFFI_FIREFOX_MAJOR_VERSION = 135
+
+_FIREFOX_VERSION_PATTERN = re.compile(r"Firefox/(?P<major>[0-9]+)(?:\.|$)")
 
 _HTTP_DATE_PATTERN = re.compile(
     r"(?:"
@@ -33,6 +36,13 @@ _HTTP_DATE_PATTERN = re.compile(
 )
 
 logger = logging.getLogger("uvicorn.error")
+
+
+def firefox_major_version(user_agent: str) -> int:
+    match = _FIREFOX_VERSION_PATTERN.search(user_agent)
+    if match is None:
+        raise ValueError("Clearance User-Agent has no Firefox version")
+    return int(match.group("major"))
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,14 @@ class ClearanceSession:
     cookies: dict[str, str]
     user_agent: str
     expires_at: float
+    firefox_major_version: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "firefox_major_version",
+            firefox_major_version(self.user_agent),
+        )
 
 
 @dataclass(frozen=True)
@@ -143,7 +161,14 @@ class CamoufoxClearanceAcquirer:
                     (cookie for cookie in cookies if cookie.get("name") == "cf_clearance"),
                     None,
                 )
-                if clearance_cookie is not None:
+                try:
+                    page_is_usable = _is_usable_who_sampled_page(
+                        str(page.url),
+                        str(page.content()),
+                    )
+                except PlaywrightError:
+                    page_is_usable = False
+                if clearance_cookie is not None and page_is_usable:
                     user_agent = str(page.evaluate("navigator.userAgent"))
                     expires = float(clearance_cookie.get("expires", -1))
                     lifetime = expires - time()
@@ -189,7 +214,9 @@ class CurlCffiBrowserlessFetcher:
         if self._session is None:
             from curl_cffi import requests
 
-            self._session = requests.Session(impersonate="firefox135")
+            self._session = requests.Session(
+                impersonate=f"firefox{clearance.firefox_major_version}"
+            )
         response = self._session.get(
             url,
             cookies=clearance.cookies,
@@ -308,7 +335,18 @@ class BrowserlessWhoSampledSession:
         except Exception as error:
             self._raise_if_deadline_expired(deadline, error)
             raise ClearanceFailedError("Clearance acquisition failed") from error
+        if clearance.firefox_major_version != CURL_CFFI_FIREFOX_MAJOR_VERSION:
+            logger.warning(
+                "clearance fingerprint incompatible firefox_major=%d expected=%d",
+                clearance.firefox_major_version,
+                CURL_CFFI_FIREFOX_MAJOR_VERSION,
+            )
+            raise ClearanceFailedError("Clearance browser fingerprint is incompatible")
         self._remaining(deadline)
+        logger.info(
+            "clearance fingerprint compatible firefox_major=%d",
+            clearance.firefox_major_version,
+        )
         logger.info("clearance acquisition completed")
         return clearance
 
@@ -420,8 +458,21 @@ class BrowserlessSamplesPage:
 
 
 def _is_challenge(response: BrowserlessResponse) -> bool:
-    normalized = response.text.lower()
+    return _is_challenge_html(response.text)
+
+
+def _is_challenge_html(html: str) -> bool:
+    normalized = html.lower()
     return "<title>just a moment" in normalized or "cf-challenge" in normalized
+
+
+def _is_usable_who_sampled_page(resolved_url: str, html: str) -> bool:
+    parsed = urlsplit(resolved_url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "www.whosampled.com"
+        and not _is_challenge_html(html)
+    )
 
 
 def _raise_if_rate_limited(response: BrowserlessResponse) -> None:
