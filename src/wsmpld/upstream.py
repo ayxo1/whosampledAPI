@@ -110,6 +110,10 @@ class FetchBrowserlessly(Protocol):
     ) -> BrowserlessResponse: ...
 
 
+class ValidateBrowserlessResponse(Protocol):
+    def __call__(self, response: BrowserlessResponse) -> None: ...
+
+
 class CamoufoxClearanceAcquirer:
     def __call__(self, timeout: float) -> ClearanceSession:
         from camoufox.sync_api import Camoufox
@@ -205,7 +209,7 @@ class CurlCffiBrowserlessFetcher:
         )
 
 
-class BrowserlessSamplesPage:
+class BrowserlessWhoSampledSession:
     def __init__(
         self,
         *,
@@ -230,13 +234,14 @@ class BrowserlessSamplesPage:
         self._last_request_started_at: float | None = None
         self._lock = Lock()
 
-    def __call__(
+    def fetch(
         self,
-        artist_slug: str,
-        location: SamplesPageLocation | None = None,
-    ) -> SamplesPage:
-        if location is not None and not isinstance(location, SamplesPageLocation):
-            raise TypeError("location must be an internal Samples page location")
+        url: str,
+        *,
+        validate_response: ValidateBrowserlessResponse,
+        resource_name: str,
+        log_url: bool = False,
+    ) -> BrowserlessResponse:
         deadline = self._monotonic() + LOOKUP_TIMEOUT_SECONDS
         acquired_lock = self._lock.acquire(timeout=self._remaining(deadline))
         if not acquired_lock:
@@ -253,27 +258,25 @@ class BrowserlessSamplesPage:
                 self._clearance = clearance
             else:
                 logger.info("reusing unexpired clearance session")
-            url = f"{BASE_URL}/{quote(artist_slug, safe='')}/samples/"
-            if location is not None:
-                url = f"{url}?sp={location.page_number}"
-            requested_page = location.page_number if location is not None else 1
-            page_number = requested_page
 
             def fetch_validated(current_clearance: ClearanceSession) -> BrowserlessResponse:
-                fetched = self._fetch(url, current_clearance, deadline)
-                _raise_if_rate_limited(fetched)
-                resolved_page = _validate_resolved_samples_url(
-                    fetched.resolved_url,
-                    artist_slug=artist_slug,
-                    requested_page=requested_page,
+                fetched = self._fetch(
+                    url,
+                    current_clearance,
+                    deadline,
+                    resource_name=resource_name,
+                    log_url=log_url,
                 )
-                nonlocal page_number
-                page_number = resolved_page
+                _raise_if_rate_limited(fetched)
+                validate_response(fetched)
                 return fetched
 
             response = fetch_validated(clearance)
             if _is_challenge(response):
-                logger.info("browserless Samples fetch challenged; refreshing clearance")
+                logger.info(
+                    "browserless %s fetch challenged; refreshing clearance",
+                    resource_name,
+                )
                 self._clearance = None
                 clearance = self._acquire(deadline)
                 self._clearance = clearance
@@ -281,15 +284,7 @@ class BrowserlessSamplesPage:
                 if _is_challenge(response):
                     self._clearance = None
                     raise ClearanceFailedError("Browserless retry was challenged")
-            if response.status_code == 404:
-                raise ArtistNotFoundError(artist_slug)
-            if response.status_code != 200:
-                raise RuntimeError(f"Unexpected upstream status {response.status_code}")
-            return SamplesPage(
-                html=response.text,
-                resolved_url=response.resolved_url,
-                page_number=page_number,
-            )
+            return response
         finally:
             self._lock.release()
 
@@ -318,15 +313,29 @@ class BrowserlessSamplesPage:
         return clearance
 
     def _fetch(
-        self, url: str, clearance: ClearanceSession, deadline: float
+        self,
+        url: str,
+        clearance: ClearanceSession,
+        deadline: float,
+        *,
+        resource_name: str,
+        log_url: bool,
     ) -> BrowserlessResponse:
-        self._pace(deadline)
+        self._pace(deadline, resource_name)
         request_started_at = self._monotonic()
-        logger.info(
-            "browserless Samples fetch started url=%s started_at=%.3f",
-            url,
-            request_started_at,
-        )
+        if log_url:
+            logger.info(
+                "browserless %s fetch started url=%s started_at=%.3f",
+                resource_name,
+                url,
+                request_started_at,
+            )
+        else:
+            logger.info(
+                "browserless %s fetch started started_at=%.3f",
+                resource_name,
+                request_started_at,
+            )
         self._last_request_started_at = request_started_at
         try:
             response = self._fetch_browserlessly(
@@ -338,10 +347,14 @@ class BrowserlessSamplesPage:
             self._raise_if_deadline_expired(deadline, error)
             raise
         self._remaining(deadline)
-        logger.info("browserless Samples fetch completed status=%d", response.status_code)
+        logger.info(
+            "browserless %s fetch completed status=%d",
+            resource_name,
+            response.status_code,
+        )
         return response
 
-    def _pace(self, deadline: float) -> None:
+    def _pace(self, deadline: float, resource_name: str) -> None:
         if self._last_request_started_at is None:
             return
         jitter = self._jitter(
@@ -354,10 +367,84 @@ class BrowserlessSamplesPage:
         delay = next_request_at - self._monotonic()
         if delay <= 0:
             return
-        logger.info("Samples request pacing wait_seconds=%.3f", delay)
+        logger.info("%s request pacing wait_seconds=%.3f", resource_name, delay)
         remaining = self._remaining(deadline)
         self._sleep(min(delay, remaining))
         self._remaining(deadline)
+
+
+class BrowserlessSamplesPage:
+    def __init__(
+        self,
+        *,
+        session: BrowserlessWhoSampledSession | None = None,
+        acquire_clearance: AcquireClearance | None = None,
+        fetch_browserlessly: FetchBrowserlessly | None = None,
+        monotonic: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = sleep,
+        jitter: Callable[[float, float], float] = random.uniform,
+        minimum_interval_seconds: float = MINIMUM_REQUEST_INTERVAL_SECONDS,
+        minimum_jitter_seconds: float = MINIMUM_REQUEST_JITTER_SECONDS,
+        maximum_jitter_seconds: float = MAXIMUM_REQUEST_JITTER_SECONDS,
+    ) -> None:
+        if session is not None:
+            if acquire_clearance is not None or fetch_browserlessly is not None:
+                raise TypeError(
+                    "session cannot be combined with clearance or browserless fetch dependencies"
+                )
+            self._session = session
+            return
+        if acquire_clearance is None or fetch_browserlessly is None:
+            raise TypeError(
+                "acquire_clearance and fetch_browserlessly are required without a session"
+            )
+        self._session = BrowserlessWhoSampledSession(
+            acquire_clearance=acquire_clearance,
+            fetch_browserlessly=fetch_browserlessly,
+            monotonic=monotonic,
+            sleep=sleep,
+            jitter=jitter,
+            minimum_interval_seconds=minimum_interval_seconds,
+            minimum_jitter_seconds=minimum_jitter_seconds,
+            maximum_jitter_seconds=maximum_jitter_seconds,
+        )
+
+    def __call__(
+        self,
+        artist_slug: str,
+        location: SamplesPageLocation | None = None,
+    ) -> SamplesPage:
+        if location is not None and not isinstance(location, SamplesPageLocation):
+            raise TypeError("location must be an internal Samples page location")
+        url = f"{BASE_URL}/{quote(artist_slug, safe='')}/samples/"
+        if location is not None:
+            url = f"{url}?sp={location.page_number}"
+        requested_page = location.page_number if location is not None else 1
+        page_number = requested_page
+
+        def validate_response(response: BrowserlessResponse) -> None:
+            nonlocal page_number
+            page_number = _validate_resolved_samples_url(
+                response.resolved_url,
+                artist_slug=artist_slug,
+                requested_page=requested_page,
+            )
+
+        response = self._session.fetch(
+            url,
+            validate_response=validate_response,
+            resource_name="Samples",
+            log_url=True,
+        )
+        if response.status_code == 404:
+            raise ArtistNotFoundError(artist_slug)
+        if response.status_code != 200:
+            raise RuntimeError(f"Unexpected upstream status {response.status_code}")
+        return SamplesPage(
+            html=response.text,
+            resolved_url=response.resolved_url,
+            page_number=page_number,
+        )
 
 
 def _is_challenge(response: BrowserlessResponse) -> bool:
@@ -409,7 +496,8 @@ def _validate_resolved_samples_url(
     return resolved_page
 
 
-live_samples_page = BrowserlessSamplesPage(
+live_who_sampled_session = BrowserlessWhoSampledSession(
     acquire_clearance=CamoufoxClearanceAcquirer(),
     fetch_browserlessly=CurlCffiBrowserlessFetcher(),
 )
+live_samples_page = BrowserlessSamplesPage(session=live_who_sampled_session)

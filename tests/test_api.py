@@ -18,6 +18,7 @@ from wsmpld.upstream import (
     ArtistNotFoundError,
     BrowserlessResponse,
     BrowserlessSamplesPage,
+    BrowserlessWhoSampledSession,
     ClearanceFailedError,
     ClearanceSession,
     FetchBrowserlessly,
@@ -165,6 +166,60 @@ def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
         "browserless Samples fetch started "
         "url=https://www.whosampled.com/Jay-Z/samples/ started_at=4.250",
     ]
+
+
+def test_artist_and_future_resource_share_clearance_session_and_pacing() -> None:
+    page_html = (FIXTURES / "one_sample_use.html").read_text(encoding="utf-8")
+    current_time = 0.0
+    acquisitions = 0
+    requested_urls: list[str] = []
+    sleeps: list[float] = []
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent="test-agent",
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        requested_urls.append(url)
+        return BrowserlessResponse(status_code=200, text=page_html, resolved_url=url)
+
+    def sleep(delay: float) -> None:
+        nonlocal current_time
+        sleeps.append(delay)
+        current_time += delay
+
+    session = BrowserlessWhoSampledSession(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: current_time,
+        sleep=sleep,
+        jitter=lambda lower, upper: 0.0,
+    )
+    fetch_samples_page = BrowserlessSamplesPage(session=session)
+
+    with _override_samples_page(fetch_samples_page):
+        artist_response = TestClient(app).get("/artists/Kanye-West/samples")
+        resource_response = session.fetch(
+            "https://www.whosampled.com/sample/123/",
+            validate_response=lambda response: None,
+            resource_name="Sample Use",
+        )
+
+    assert artist_response.status_code == 200
+    assert resource_response.status_code == 200
+    assert acquisitions == 1
+    assert requested_urls == [
+        "https://www.whosampled.com/Kanye-West/samples/",
+        "https://www.whosampled.com/sample/123/",
+    ]
+    assert sleeps == [4.0]
 
 
 def test_cache_hit_returns_without_pacing_or_an_upstream_request(
