@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -92,7 +93,19 @@ def test_user_receives_one_sample_use_by_default() -> None:
         response = TestClient(app).get("/artists/Kanye-West/samples")
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body.pop("schema_version") == 1
+    assert set(body.pop("observation")) == {
+        "fetched_at",
+        "source_url",
+        "content_sha256",
+        "parser_version",
+    }
+    assert body["items"][0].pop("sample_use_id") == 100
+    assert body["items"][0].pop("sample_use_url") == (
+        "https://www.whosampled.com/sample/100/power-sampled-schizoid-man/"
+    )
+    assert body == {
         "artist": {
             "requested_slug": "Kanye-West",
             "name": "Kanye West",
@@ -117,6 +130,128 @@ def test_user_receives_one_sample_use_by_default() -> None:
         ],
         "pagination": {"next_cursor": None, "returned": 1, "has_more": False},
     }
+
+
+def test_artist_samples_expose_relationship_identities_and_page_observation() -> None:
+    page = SamplesPage(
+        html=(FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8"),
+        resolved_url="https://www.whosampled.com/Example-Artist/samples/",
+        fetched_at=datetime(2026, 9, 3, 4, 5, 6, tzinfo=UTC),
+    )
+    with _override_samples_page(lambda artist_slug: page):
+        response = TestClient(app).get("/artists/Example-Artist/samples?limit=max")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == 1
+    assert body["observation"] == {
+        "fetched_at": "2026-09-03T04:05:06Z",
+        "source_url": "https://www.whosampled.com/Example-Artist/samples/",
+        "content_sha256": (
+            "477c1b510d28135e5dbbf672a1fbcc643bc753f376cb430762398b7869fcb5b1"
+        ),
+        "parser_version": "1",
+    }
+    assert [
+        (item["sample_use_id"], item["sample_use_url"])
+        for item in body["items"]
+    ] == [
+        (1, "https://www.whosampled.com/sample/1/example-first/"),
+        (2, "https://www.whosampled.com/sample/2/example-second/"),
+        (3, "https://www.whosampled.com/sample/3/example-film/"),
+    ]
+    assert body["items"][0]["source_recording"] == {
+        "title": "First Source",
+        "artist_credit": "Source Artist",
+        "year": 1971,
+        "url": "https://www.whosampled.com/sample/1/example-first/",
+    }
+
+
+@pytest.mark.parametrize(
+    "relationship_url",
+    [
+        "/sample/not-numeric/example-first/",
+        "/sample/0/example-first/",
+        "/sample/-1/example-first/",
+    ],
+)
+def test_invalid_sample_use_identity_invalidates_the_entire_upstream_page(
+    relationship_url: str,
+) -> None:
+    document = (FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8")
+    document = document.replace("/sample/2/example-second/", relationship_url)
+    page = SamplesPage(
+        html=document,
+        resolved_url="https://www.whosampled.com/Example-Artist/samples/",
+    )
+
+    with _override_samples_page(lambda artist_slug: page):
+        response = TestClient(app).get(
+            "/artists/Example-Artist/samples?limit=max"
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": {
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        }
+    }
+
+
+def test_cached_samples_page_retains_its_original_observation() -> None:
+    page_html = (FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8")
+    fetches = 0
+
+    def fetch(artist_slug: str) -> SamplesPage:
+        nonlocal fetches
+        fetches += 1
+        return SamplesPage(
+            html=page_html,
+            resolved_url="https://www.whosampled.com/Example-Artist/samples/",
+            fetched_at=datetime(2026, 9, 3, 4, 5, fetches, tzinfo=UTC),
+        )
+
+    client = TestClient(app)
+    with _override_samples_page(fetch):
+        first_response = client.get("/artists/Example-Artist/samples?limit=1")
+        second_response = client.get("/artists/Example-Artist/samples?limit=max")
+
+    assert [first_response.status_code, second_response.status_code] == [200, 200]
+    assert fetches == 1
+    assert first_response.json()["observation"] == second_response.json()[
+        "observation"
+    ]
+    assert first_response.json()["observation"]["fetched_at"] == (
+        "2026-09-03T04:05:01Z"
+    )
+    assert first_response.json()["observation"]["content_sha256"] == (
+        "477c1b510d28135e5dbbf672a1fbcc643bc753f376cb430762398b7869fcb5b1"
+    )
+
+
+def test_artist_observation_uses_browserless_response_receipt_time() -> None:
+    page_html = (FIXTURES / "live_sample_uses.html").read_text(encoding="utf-8")
+    received_at = datetime(2026, 9, 3, 4, 5, 6, tzinfo=UTC)
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        return BrowserlessResponse(
+            status_code=200,
+            text=page_html,
+            resolved_url=url,
+            fetched_at=received_at,
+        )
+
+    with _override_samples_page(_browserless_page(fetch_browserlessly)):
+        response = TestClient(app).get(
+            "/artists/Example-Artist/samples?limit=max"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["observation"]["fetched_at"] == "2026-09-03T04:05:06Z"
 
 
 def test_uncached_requests_use_default_process_wide_spacing_and_jitter(
@@ -1370,6 +1505,38 @@ def test_generated_docs_describe_the_samples_contract() -> None:
         "anyOf": [{"type": "string"}, {"type": "null"}],
         "title": "Next Cursor",
     }
+    samples_response_schema = schema["components"]["schemas"]["SamplesResponse"]
+    assert samples_response_schema["properties"]["schema_version"]["const"] == 1
+    assert samples_response_schema["properties"]["observation"] == {
+        "$ref": "#/components/schemas/Observation"
+    }
+    sample_use_schema = schema["components"]["schemas"]["SampleUse"]
+    assert "positive numeric WhoSampled relationship ID" in (
+        sample_use_schema["properties"]["sample_use_id"]["description"]
+    )
+    assert "canonical WhoSampled relationship URL" in (
+        sample_use_schema["properties"]["sample_use_url"]["description"]
+    )
+    source_url_schema = schema["components"]["schemas"]["SourceRecording"][
+        "properties"
+    ]["url"]
+    assert source_url_schema["deprecated"] is True
+    assert "Do not use it as a Source Recording identity" in source_url_schema[
+        "description"
+    ]
+    observation_schema = schema["components"]["schemas"]["Observation"]
+    assert set(observation_schema["required"]) == {
+        "fetched_at",
+        "source_url",
+        "content_sha256",
+        "parser_version",
+    }
+    assert "upstream response was fetched" in observation_schema["properties"][
+        "fetched_at"
+    ]["description"]
+    assert "SHA-256" in observation_schema["properties"]["content_sha256"][
+        "description"
+    ]
     assert {
         status: operation["responses"][status]["content"]["application/json"]["example"]
         for status in ("400", "404", "409", "502", "504")
@@ -1456,7 +1623,12 @@ def test_2pac_samples_use_page_artist_when_live_track_credit_is_implicit() -> No
         response = TestClient(app).get("/artists/2Pac/samples?limit=max")
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body.pop("schema_version") == 1
+    assert body.pop("observation")["source_url"] == (
+        "https://www.whosampled.com/2Pac/samples/"
+    )
+    assert body == {
         "artist": {
             "requested_slug": "2Pac",
             "name": "2Pac",
@@ -1464,6 +1636,8 @@ def test_2pac_samples_use_page_artist_when_live_track_credit_is_implicit() -> No
         },
         "items": [
             {
+                "sample_use_id": 8,
+                "sample_use_url": "https://www.whosampled.com/sample/8/example-source/",
                 "sampling_recording": {
                     "title": "Example Track",
                     "artist_credit": "2Pac",
@@ -1780,6 +1954,118 @@ def test_clearance_waits_for_usable_who_sampled_page_before_fetching(
     assert fetches == 1
     assert len(pages) == 1
     assert pages[0].waits >= 1
+
+
+def test_clearance_keeps_interacting_with_challenge_until_it_is_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_time = 0.0
+    fetches = 0
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.context = self
+            self.frames = [FakeFrame(self)]
+            self.ready = False
+            self.url = "https://www.whosampled.com/"
+            self.interactions = 0
+
+        def goto(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def cookies(self) -> list[dict[str, object]]:
+            if not self.ready:
+                return []
+            return [
+                {
+                    "name": "cf_clearance",
+                    "value": "secret",
+                    "expires": -1,
+                }
+            ]
+
+        def content(self) -> str:
+            if not self.ready:
+                return "<html><title>Just a moment...</title></html>"
+            return "<html><title>WhoSampled</title></html>"
+
+        def evaluate(self, expression: str) -> str:
+            return FIREFOX_135_USER_AGENT
+
+        def wait_for_timeout(self, milliseconds: int) -> None:
+            nonlocal current_time
+            current_time += milliseconds / 1_000
+
+    class FakeBody:
+        def __init__(self, page: FakePage) -> None:
+            self.page = page
+
+        def bounding_box(self) -> dict[str, int]:
+            return {"x": 0, "y": 0, "width": 100, "height": 100}
+
+        def click(self, *args: object, **kwargs: object) -> None:
+            self.page.interactions += 1
+            self.page.ready = self.page.interactions == 4
+
+    class FakeFrame:
+        def __init__(self, page: FakePage) -> None:
+            self.url = "https://challenges.cloudflare.com/widget"
+            self.body = FakeBody(page)
+
+        def locator(self, selector: str) -> FakeBody:
+            return self.body
+
+    page = FakePage()
+
+    class FakeBrowser:
+        def __enter__(self) -> "FakeBrowser":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def new_page(self) -> FakePage:
+            return page
+
+    monkeypatch.setitem(
+        sys.modules,
+        "camoufox.sync_api",
+        SimpleNamespace(Camoufox=lambda **kwargs: FakeBrowser()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.sync_api",
+        SimpleNamespace(Error=RuntimeError),
+    )
+    monkeypatch.setattr("wsmpld.upstream.monotonic", lambda: current_time)
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=200,
+            text=(FIXTURES / "one_sample_use.html").read_text(encoding="utf-8"),
+            resolved_url=url,
+        )
+
+    fetch_samples_page = _browserless_samples_page(
+        acquire_clearance=CamoufoxClearanceAcquirer(),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: current_time,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_samples_page(fetch_samples_page):
+        response = TestClient(app).get("/artists/Kanye-West/samples")
+
+    assert response.status_code == 200
+    assert page.interactions == 4
+    assert fetches == 1
 
 
 def test_complete_lookup_timeout_has_stable_gateway_timeout_response(
@@ -2388,7 +2674,12 @@ def test_existing_artist_without_sample_uses_has_empty_success_response() -> Non
         response = TestClient(app).get("/artists/No-Samples-Artist/samples?limit=max")
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body.pop("schema_version") == 1
+    assert body.pop("observation")["source_url"] == (
+        "https://www.whosampled.com/No-Samples-Artist/samples/"
+    )
+    assert body == {
         "artist": {
             "requested_slug": "No-Samples-Artist",
             "name": "No Samples Artist",

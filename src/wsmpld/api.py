@@ -1,4 +1,5 @@
 import logging
+from hashlib import sha256
 from typing import Annotated, Literal
 from unicodedata import normalize
 from urllib.parse import urlsplit, urlunsplit
@@ -7,8 +8,9 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from pydantic import AfterValidator, Field, HttpUrl, ValidationError
 
 from wsmpld.cursor import CursorPosition, InvalidCursorError, decode_cursor, encode_cursor
-from wsmpld.models import Artist, ErrorResponse, Pagination, SamplesResponse
+from wsmpld.models import Artist, ErrorResponse, Observation, Pagination, SamplesResponse
 from wsmpld.page_cache import ParsedSamplesPageCache
+from wsmpld.parser import SAMPLES_PARSER_VERSION
 from wsmpld.upstream import (
     ArtistNotFoundError,
     ClearanceFailedError,
@@ -246,6 +248,7 @@ def read_samples(
     next_cursor = encode_cursor(next_position) if next_position is not None else None
     try:
         return SamplesResponse(
+            schema_version=1,
             artist=Artist(
                 requested_slug=artist_slug,
                 name=parsed.artist_name,
@@ -256,6 +259,12 @@ def read_samples(
                 next_cursor=next_cursor,
                 returned=len(items),
                 has_more=next_cursor is not None,
+            ),
+            observation=Observation(
+                fetched_at=page.fetched_at,
+                source_url=HttpUrl(page.resolved_url),
+                content_sha256=sha256(page.html.encode("utf-8")).hexdigest(),
+                parser_version=SAMPLES_PARSER_VERSION,
             ),
         )
     except (ValidationError, ValueError) as error:
