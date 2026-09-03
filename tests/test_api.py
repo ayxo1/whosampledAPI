@@ -16,21 +16,24 @@ import pytest
 from curl_cffi.requests.exceptions import TooManyRedirects
 from fastapi.testclient import TestClient
 
-from wsmpld.api import app, get_samples_page, get_samples_page_cache
+from wsmpld.api import app, get_sample_use_page, get_samples_page, get_samples_page_cache
 from wsmpld.page_cache import ParsedSamplesPageCache
 from wsmpld.upstream import (
     ArtistNotFoundError,
     BrowserlessResponse,
     BrowserlessSamplesPage,
+    BrowserlessSampleUsePage,
     BrowserlessWhoSampledSession,
     CamoufoxClearanceAcquirer,
     ClearanceFailedError,
     ClearanceSession,
     FetchBrowserlessly,
     FetchSamplesPage,
+    FetchSampleUsePage,
     LookupTimeoutError,
     SamplesPage,
     SamplesPageLocation,
+    SampleUsePage,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -62,6 +65,17 @@ def _override_samples_page(
         app.dependency_overrides.clear()
 
 
+@contextmanager
+def _override_sample_use_page(
+    fetch_sample_use_page: FetchSampleUsePage,
+) -> Iterator[None]:
+    app.dependency_overrides[get_sample_use_page] = lambda: fetch_sample_use_page
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+
+
 def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSamplesPage:
     return _browserless_samples_page(
         acquire_clearance=lambda timeout: ClearanceSession(
@@ -82,6 +96,111 @@ def _browserless_samples_page(**session_options: Any) -> BrowserlessSamplesPage:
     return BrowserlessSamplesPage(
         session=BrowserlessWhoSampledSession(**session_options)
     )
+
+
+def test_user_retrieves_one_direct_sample_use_by_numeric_id() -> None:
+    requested_ids: list[int] = []
+    page = SampleUsePage(
+        html=(FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8"),
+        resolved_url=(
+            "https://www.whosampled.com/sample/211335/"
+            "Kanye-West-Charlie-Wilson-Bound-2-Ponderosa-Twins-Plus-One-Bound/"
+        ),
+    )
+
+    def fetch(sample_use_id: int) -> SampleUsePage:
+        requested_ids.append(sample_use_id)
+        return page
+
+    with _override_sample_use_page(fetch):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 200
+    assert requested_ids == [211335]
+    assert response.json() == {
+        "schema_version": 1,
+        "sample_use_id": 211335,
+        "sample_use_url": (
+            "https://www.whosampled.com/sample/211335/"
+            "Kanye-West-Charlie-Wilson-Bound-2-Ponderosa-Twins-Plus-One-Bound/"
+        ),
+        "connection_type": "direct_sample",
+        "sampling_recording": {
+            "title": "Bound 2",
+            "url": "https://www.whosampled.com/Kanye-West/Bound-2/",
+        },
+        "source_material": {
+            "title": "Bound",
+            "url": "https://www.whosampled.com/Ponderosa-Twins-Plus-One/Bound/",
+        },
+    }
+
+
+def test_sample_use_fetches_id_only_path_and_accepts_same_id_slug_redirect() -> None:
+    requested_urls: list[str] = []
+
+    def fetch_browserlessly(
+        url: str,
+        clearance: ClearanceSession,
+        timeout: float,
+    ) -> BrowserlessResponse:
+        requested_urls.append(url)
+        return BrowserlessResponse(
+            status_code=200,
+            text=(FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8"),
+            resolved_url=(
+                "https://www.whosampled.com/sample/211335/"
+                "Kanye-West-Charlie-Wilson-Bound-2-Ponderosa-Twins-Plus-One-Bound/"
+            ),
+        )
+
+    fetch_page = BrowserlessSampleUsePage(
+        session=BrowserlessWhoSampledSession(
+            acquire_clearance=lambda timeout: ClearanceSession(
+                cookies={"cf_clearance": "secret"},
+                user_agent=FIREFOX_135_USER_AGENT,
+                expires_at=10_000.0,
+            ),
+            fetch_browserlessly=fetch_browserlessly,
+            monotonic=lambda: 0.0,
+            sleep=lambda delay: None,
+            minimum_interval_seconds=0.0,
+            minimum_jitter_seconds=0.0,
+            maximum_jitter_seconds=0.0,
+        )
+    )
+
+    page = fetch_page(211335)
+
+    assert requested_urls == ["https://www.whosampled.com/sample/211335/"]
+    assert page.resolved_url.endswith(
+        "/sample/211335/"
+        "Kanye-West-Charlie-Wilson-Bound-2-Ponderosa-Twins-Plus-One-Bound/"
+    )
+
+
+def test_openapi_describes_the_core_sample_use_route() -> None:
+    schema = TestClient(app).get("/openapi.json").json()
+
+    operation = schema["paths"]["/sample-uses/{sample_use_id}"]["get"]
+    path_parameter = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["name"] == "sample_use_id"
+    )
+    assert path_parameter["required"] is True
+    assert path_parameter["schema"]["exclusiveMinimum"] == 0
+    success_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert success_schema == {"$ref": "#/components/schemas/SampleUseDetailResponse"}
+    response_schema = schema["components"]["schemas"]["SampleUseDetailResponse"]
+    assert response_schema["required"] == [
+        "schema_version",
+        "sample_use_id",
+        "sample_use_url",
+        "connection_type",
+        "sampling_recording",
+        "source_material",
+    ]
 
 
 def test_user_receives_one_sample_use_by_default() -> None:

@@ -11,7 +11,7 @@ from itertools import pairwise
 import httpx
 import pytest
 
-from wsmpld.models import SamplesResponse
+from wsmpld.models import SamplesResponse, SampleUseDetailResponse
 
 
 def _free_loopback_port() -> int:
@@ -148,6 +148,28 @@ def test_two_live_kanye_west_requests_reuse_the_parsed_page() -> None:
     assert logs.count("browserless Samples fetch started") == 1
     assert logs.count("Samples data fetch started transport=curl_cffi") == 1
     assert logs.count("Samples data fetch started") == 1
+
+
+@pytest.mark.live
+def test_live_direct_sample_use_is_retrieved_by_numeric_id() -> None:
+    responses, request_error, logs = _request_running_api(["/sample-uses/211335"])
+    assert request_error is None, [repr(request_error), logs]
+    assert len(responses) == 1
+    response = responses[0]
+    if response.status_code != 200:
+        print(logs)
+    assert response.status_code == 200, [response.text, logs]
+
+    parsed = SampleUseDetailResponse.model_validate(response.json())
+    assert parsed.schema_version == 1
+    assert parsed.sample_use_id == 211335
+    assert parsed.connection_type == "direct_sample"
+    assert "/sample/211335/" in str(parsed.sample_use_url)
+    assert parsed.sampling_recording.title == "Bound 2"
+    assert parsed.source_material.title == "Bound"
+    assert logs.count("visible unattended Camoufox clearance acquisition started") == 1
+    assert logs.count("browserless Sample Use fetch started") == 1
+    assert logs.count("Samples data fetch started transport=curl_cffi") == 1
 
 
 @pytest.mark.live

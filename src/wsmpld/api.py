@@ -8,16 +8,25 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from pydantic import AfterValidator, Field, HttpUrl, ValidationError
 
 from wsmpld.cursor import CursorPosition, InvalidCursorError, decode_cursor, encode_cursor
-from wsmpld.models import Artist, ErrorResponse, Observation, Pagination, SamplesResponse
+from wsmpld.models import (
+    Artist,
+    ErrorResponse,
+    Observation,
+    Pagination,
+    SamplesResponse,
+    SampleUseDetailResponse,
+)
 from wsmpld.page_cache import ParsedSamplesPageCache
-from wsmpld.parser import SAMPLES_PARSER_VERSION
+from wsmpld.parser import SAMPLES_PARSER_VERSION, parse_sample_use_detail
 from wsmpld.upstream import (
     ArtistNotFoundError,
     ClearanceFailedError,
     FetchSamplesPage,
+    FetchSampleUsePage,
     LookupTimeoutError,
     SamplesPageLocation,
     UpstreamRateLimitedError,
+    live_sample_use_page,
     live_samples_page,
 )
 
@@ -81,6 +90,10 @@ def get_samples_page() -> FetchSamplesPage:
     return live_samples_page
 
 
+def get_sample_use_page() -> FetchSampleUsePage:
+    return live_sample_use_page
+
+
 samples_page_cache = ParsedSamplesPageCache()
 
 
@@ -138,6 +151,41 @@ app = FastAPI(
     title="WhoSampled Samples API",
     description="A local API for Sample Uses attributed to a requested artist.",
 )
+
+
+@app.get(
+    "/sample-uses/{sample_use_id}",
+    response_model=SampleUseDetailResponse,
+    summary="Get one direct Sample Use",
+    description=(
+        "Retrieve the core Sampling Recording and Source Material for one direct "
+        "Sample Use by its positive numeric WhoSampled ID."
+    ),
+)
+def read_sample_use(
+    sample_use_id: Annotated[
+        int,
+        Path(
+            gt=0,
+            title="WhoSampled Sample Use ID",
+            description="A positive numeric WhoSampled Sample Use ID.",
+        ),
+    ],
+    fetch_sample_use_page: Annotated[FetchSampleUsePage, Depends(get_sample_use_page)],
+) -> SampleUseDetailResponse:
+    try:
+        page = fetch_sample_use_page(sample_use_id)
+        parsed = parse_sample_use_detail(page.html)
+        return SampleUseDetailResponse(
+            schema_version=1,
+            sample_use_id=sample_use_id,
+            sample_use_url=HttpUrl(page.resolved_url),
+            connection_type="direct_sample",
+            sampling_recording=parsed.sampling_recording,
+            source_material=parsed.source_material,
+        )
+    except (ValidationError, ValueError) as error:
+        raise _upstream_invalid() from error
 
 
 @app.get(
