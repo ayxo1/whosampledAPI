@@ -53,6 +53,34 @@ class SampleUse(BaseModel):
     source_recording: SourceRecording
 
 
+class SamplingRecordingSummary(BaseModel):
+    title: str
+    url: WhoSampledUrl
+
+
+class SourceMaterialSummary(BaseModel):
+    title: str
+    url: WhoSampledUrl
+
+
+class SampleUseDetailResponse(BaseModel):
+    schema_version: Annotated[
+        Literal[1],
+        Field(description="The public Sample Use response schema version."),
+    ]
+    sample_use_id: Annotated[
+        int,
+        Field(gt=0, description="The requested positive numeric Sample Use ID."),
+    ]
+    sample_use_url: Annotated[
+        WhoSampledUrl,
+        Field(description="The resolved same-ID WhoSampled relationship URL."),
+    ]
+    connection_type: Literal["direct_sample"]
+    sampling_recording: SamplingRecordingSummary
+    source_material: SourceMaterialSummary
+
+
 class Artist(BaseModel):
     requested_slug: str
     name: str

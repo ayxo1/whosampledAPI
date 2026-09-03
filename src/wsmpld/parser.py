@@ -6,7 +6,13 @@ from urllib.parse import urljoin, urlsplit
 from lxml import html
 from pydantic import HttpUrl
 
-from wsmpld.models import SampleUse, SamplingRecording, SourceRecording
+from wsmpld.models import (
+    SampleUse,
+    SamplingRecording,
+    SamplingRecordingSummary,
+    SourceMaterialSummary,
+    SourceRecording,
+)
 from wsmpld.samples_url import BASE_URL, samples_page_link_number
 
 SAMPLES_PARSER_VERSION = "1"
@@ -25,6 +31,12 @@ class _ParsedRecording:
     artist_credit: str
     year: int | None
     url: HttpUrl
+
+
+@dataclass(frozen=True)
+class ParsedSampleUseDetail:
+    sampling_recording: SamplingRecordingSummary
+    source_material: SourceMaterialSummary
 
 
 def _elements(element: html.HtmlElement, expression: str) -> list[html.HtmlElement]:
@@ -98,6 +110,46 @@ def _sample_use_identity(href: str) -> tuple[int, HttpUrl]:
 
 def _xpath_has_class(name: str) -> str:
     return f"contains(concat(' ', normalize-space(@class), ' '), ' {name} ')"
+
+
+def _detail_work(root: html.HtmlElement, container_id: str) -> tuple[str, HttpUrl]:
+    containers = _elements(root, f"//*[@id='{container_id}']")
+    if len(containers) != 1:
+        raise ValueError("Missing primary Sample Use work")
+    title_links = _elements(
+        containers[0],
+        f".//a[{_xpath_has_class('trackName')}][@itemprop='url'][@href]",
+    )
+    if len(title_links) != 1:
+        raise ValueError("Malformed primary Sample Use work")
+    title = " ".join(title_links[0].text_content().split())
+    href = title_links[0].get("href")
+    if not title or href is None:
+        raise ValueError("Malformed primary Sample Use work")
+    return title, HttpUrl(urljoin(BASE_URL, href))
+
+
+def parse_sample_use_detail(document: str) -> ParsedSampleUseDetail:
+    root = html.fromstring(document)
+    headings = _elements(
+        root,
+        f"//h2[{_xpath_has_class('section-header-title')}][starts-with(normalize-space(), "
+        "'Direct Sample of ')]",
+    )
+    if len(headings) != 1:
+        raise ValueError("Sample Use is not a direct sample")
+    sampling_title, sampling_url = _detail_work(root, "sampleWrap_dest")
+    source_title, source_url = _detail_work(root, "sampleWrap_source")
+    return ParsedSampleUseDetail(
+        sampling_recording=SamplingRecordingSummary(
+            title=sampling_title,
+            url=sampling_url,
+        ),
+        source_material=SourceMaterialSummary(
+            title=source_title,
+            url=source_url,
+        ),
+    )
 
 
 def _live_year(element: html.HtmlElement, selector: str) -> int | None:

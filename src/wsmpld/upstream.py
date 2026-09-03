@@ -67,6 +67,12 @@ class SamplesPage:
 
 
 @dataclass(frozen=True)
+class SampleUsePage:
+    html: str
+    resolved_url: str
+
+
+@dataclass(frozen=True)
 class SamplesPageLocation:
     page_number: int
 
@@ -111,6 +117,10 @@ class FetchSamplesPage(Protocol):
         artist_slug: str,
         location: SamplesPageLocation | None = None,
     ) -> SamplesPage: ...
+
+
+class FetchSampleUsePage(Protocol):
+    def __call__(self, sample_use_id: int) -> SampleUsePage: ...
 
 
 class ArtistNotFoundError(Exception):
@@ -473,6 +483,34 @@ class BrowserlessSamplesPage:
         )
 
 
+class BrowserlessSampleUsePage:
+    def __init__(self, *, session: BrowserlessWhoSampledSession) -> None:
+        self._session = session
+
+    def __call__(self, sample_use_id: int) -> SampleUsePage:
+        if type(sample_use_id) is not int or sample_use_id < 1:
+            raise TypeError("sample_use_id must be a positive integer")
+        url = f"{BASE_URL}/sample/{sample_use_id}/"
+
+        def validate_response(response: BrowserlessResponse) -> None:
+            _validate_resolved_sample_use_url(
+                response.resolved_url,
+                sample_use_id=sample_use_id,
+            )
+
+        response = self._session.fetch(
+            url,
+            validate_response=validate_response,
+            resource_name="Sample Use",
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Unexpected upstream status {response.status_code}")
+        return SampleUsePage(
+            html=response.text,
+            resolved_url=response.resolved_url,
+        )
+
+
 def _is_challenge(response: BrowserlessResponse) -> bool:
     return _is_challenge_html(response.text)
 
@@ -535,8 +573,27 @@ def _validate_resolved_samples_url(
     return resolved_page
 
 
+def _validate_resolved_sample_use_url(
+    resolved_url: str,
+    *,
+    sample_use_id: int,
+) -> None:
+    parsed = urlsplit(resolved_url)
+    match = re.fullmatch(r"/sample/([1-9][0-9]*)/(?:[^/]+/)?", parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "www.whosampled.com"
+        or parsed.query
+        or parsed.fragment
+        or match is None
+        or int(match.group(1)) != sample_use_id
+    ):
+        raise RuntimeError("Invalid Sample Use redirect destination")
+
+
 live_who_sampled_session = BrowserlessWhoSampledSession(
     acquire_clearance=CamoufoxClearanceAcquirer(),
     fetch_browserlessly=CurlCffiBrowserlessFetcher(),
 )
 live_samples_page = BrowserlessSamplesPage(session=live_who_sampled_session)
+live_sample_use_page = BrowserlessSampleUsePage(session=live_who_sampled_session)
