@@ -5,11 +5,16 @@ Run from the repository root with:
     python -m diagnostics.cookie_reuse
 """
 
-import time
 from typing import Any
+from urllib.parse import urlsplit
 
-from camoufox.sync_api import Camoufox
 from curl_cffi import requests as cf_requests
+
+from wsmpld.upstream import (
+    CURL_CFFI_FIREFOX_MAJOR_VERSION,
+    CamoufoxClearanceAcquirer,
+    firefox_major_version,
+)
 
 BASE_URL = "https://www.whosampled.com"
 BROWSER_ARTIST = "Structure"
@@ -19,39 +24,13 @@ BROWSERLESS_ARTIST = "Kanye-West"
 def _solve_with_browser(artist: str) -> tuple[list[dict[str, Any]], str]:
     url = f"{BASE_URL}/{artist}/"
     print(f"[browser] solving challenge for {url}")
-
-    with Camoufox(headless=False, humanize=True, os="macos") as browser:
-        page = browser.new_page()
-        page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-        stable_title: str | None = None
-        stable_count = 0
-        deadline = time.time() + 30
-        last_title: str | None = None
-
-        while time.time() < deadline:
-            title = page.title()
-            transitional = "Just a moment" in title or "Loading" in title
-            stable_count = stable_count + 1 if not transitional and title == last_title else 0
-            last_title = title
-            if stable_count >= 2:
-                stable_title = title
-                break
-            page.wait_for_timeout(500)
-
-        print(f"[browser] final title: {stable_title!r}")
-        if stable_title is None or "moment" in stable_title.lower():
-            raise RuntimeError("Challenge never resolved within the deadline")
-
-        cookies: list[dict[str, Any]] = page.context.cookies()
-        user_agent = str(page.evaluate("navigator.userAgent"))
-        clearance_cookie = next(
-            (cookie for cookie in cookies if cookie["name"] == "cf_clearance"), None
-        )
-        if clearance_cookie is None:
-            raise RuntimeError("No cf_clearance cookie found after solving")
-
-        print(f"[browser] got cf_clearance (expires {clearance_cookie.get('expires')})")
-        return cookies, user_agent
+    clearance = CamoufoxClearanceAcquirer()(90.0)
+    cookies: list[dict[str, Any]] = [
+        {"name": name, "value": value}
+        for name, value in clearance.cookies.items()
+    ]
+    print("[browser] acquired usable WhoSampled clearance")
+    return cookies, clearance.user_agent
 
 
 def _fetch_with_cookies(
@@ -59,6 +38,24 @@ def _fetch_with_cookies(
 ) -> bool:
     url = f"{BASE_URL}/{artist}/"
     print(f"\n[curl_cffi] fetching {url} with reused clearance, no browser")
+    try:
+        browser_major = firefox_major_version(user_agent)
+    except ValueError:
+        print("[handoff] browser major: unparseable")
+        return False
+    impersonation_profile = f"firefox{browser_major}"
+    print(f"[handoff] browser major: {browser_major}")
+    print(f"[handoff] impersonation profile: {impersonation_profile}")
+    print(
+        "[handoff] cookie names: "
+        + ", ".join(sorted(str(cookie["name"]) for cookie in cookies))
+    )
+    if browser_major != CURL_CFFI_FIREFOX_MAJOR_VERSION:
+        print(
+            "[handoff] incompatible browser major; "
+            f"expected {CURL_CFFI_FIREFOX_MAJOR_VERSION}"
+        )
+        return False
     jar = {str(cookie["name"]): str(cookie["value"]) for cookie in cookies}
     headers = {
         "User-Agent": user_agent,
@@ -66,11 +63,18 @@ def _fetch_with_cookies(
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    with cf_requests.Session(impersonate="firefox135") as client:
+    with cf_requests.Session(impersonate=impersonation_profile) as client:
         response = client.get(url, cookies=jar, headers=headers, timeout=20)
 
+    resolved_host = urlsplit(str(getattr(response, "url", url))).hostname
+    challenged = (
+        "just a moment" in response.text.lower()
+        or "cf-challenge" in response.text.lower()
+    )
+    print(f"[curl_cffi] resolved host: {resolved_host}")
     print(f"[curl_cffi] status: {response.status_code}")
-    if "Just a moment" in response.text or "cf-challenge" in response.text.lower():
+    print(f"[curl_cffi] challenged: {challenged}")
+    if challenged:
         print("Browserless fetch was challenged. Cookie reuse failed.")
         return False
     if response.status_code != 200:
@@ -78,7 +82,6 @@ def _fetch_with_cookies(
         return False
     if artist.lower() not in response.text.lower():
         print("Response was not challenged, but the artist name was absent.")
-        print(f"First 300 characters: {response.text[:300]}")
         return False
     print(f"Got real browserless content for {artist!r}.")
     return True
