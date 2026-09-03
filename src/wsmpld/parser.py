@@ -1,13 +1,15 @@
 import re
 from dataclasses import dataclass
 from typing import cast
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from lxml import html
 from pydantic import HttpUrl
 
 from wsmpld.models import SampleUse, SamplingRecording, SourceRecording
 from wsmpld.samples_url import BASE_URL, samples_page_link_number
+
+SAMPLES_PARSER_VERSION = "1"
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,21 @@ def _recording(element: html.HtmlElement) -> _ParsedRecording:
         year=_year(element),
         url=_url(element),
     )
+
+
+def _sample_use_identity(href: str) -> tuple[int, HttpUrl]:
+    resolved = urljoin(BASE_URL, href)
+    parsed = urlsplit(resolved)
+    match = re.fullmatch(r"/sample/([1-9][0-9]*)/[^/]+/", parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "www.whosampled.com"
+        or parsed.query
+        or parsed.fragment
+        or match is None
+    ):
+        raise ValueError("Invalid Sample Use URL")
+    return int(match.group(1)), HttpUrl(resolved)
 
 
 def _xpath_has_class(name: str) -> str:
@@ -205,8 +222,11 @@ def _live_samples_page(
             if source_match is None:
                 raise ValueError("Malformed Source Recording metadata")
             source_credit, source_year = source_match.groups()
+            sample_use_id, sample_use_url = _sample_use_identity(source_href)
             items.append(
                 SampleUse(
+                    sample_use_id=sample_use_id,
+                    sample_use_url=sample_use_url,
                     sampling_recording=SamplingRecording(
                         title=sampling_title,
                         artist_credit=sampling_credit,
@@ -289,8 +309,14 @@ def parse_samples_page(
 
         for source_element in source:
             source_recording = _recording(source_element)
+            relationship_href = source_element.get("data-sample-use-url")
+            if relationship_href is None:
+                raise ValueError("Missing required Sample Use URL")
+            sample_use_id, sample_use_url = _sample_use_identity(relationship_href)
             items.append(
                 SampleUse(
+                    sample_use_id=sample_use_id,
+                    sample_use_url=sample_use_url,
                     sampling_recording=SamplingRecording(
                         title=sampling_recording.title,
                         artist_credit=sampling_recording.artist_credit,

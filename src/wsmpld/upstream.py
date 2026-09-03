@@ -3,6 +3,7 @@ import random
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from threading import Lock
 from time import monotonic, sleep, time
@@ -38,6 +39,11 @@ _HTTP_DATE_PATTERN = re.compile(
 logger = logging.getLogger("uvicorn.error")
 
 
+def _require_aware_timestamp(value: datetime, *, label: str) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must include a UTC offset")
+
+
 def firefox_major_version(user_agent: str) -> int:
     match = _FIREFOX_VERSION_PATTERN.search(user_agent)
     if match is None:
@@ -50,12 +56,14 @@ class SamplesPage:
     html: str
     resolved_url: str
     page_number: int | None = None
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
         if self.page_number is not None and (
             type(self.page_number) is not int or self.page_number < 1
         ):
             raise ValueError("Resolved Samples page must be a positive integer")
+        _require_aware_timestamp(self.fetched_at, label="Samples fetch time")
 
 
 @dataclass(frozen=True)
@@ -88,6 +96,13 @@ class BrowserlessResponse:
     text: str
     resolved_url: str
     headers: Mapping[str, str] = field(default_factory=dict)
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        _require_aware_timestamp(
+            self.fetched_at,
+            label="Browserless response fetch time",
+        )
 
 
 class FetchSamplesPage(Protocol):
@@ -180,7 +195,7 @@ class CamoufoxClearanceAcquirer:
                         expires_at=monotonic() + lifetime,
                     )
                 now = monotonic()
-                if now >= next_interaction and interaction_attempts < 3:
+                if now >= next_interaction:
                     for frame in page.frames:
                         if "challenges.cloudflare.com" not in frame.url:
                             continue
@@ -454,6 +469,7 @@ class BrowserlessSamplesPage:
             html=response.text,
             resolved_url=response.resolved_url,
             page_number=page_number,
+            fetched_at=response.fetched_at,
         )
 
 
