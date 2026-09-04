@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import sys
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -94,6 +95,12 @@ def _browserless_page(fetch_browserlessly: FetchBrowserlessly) -> BrowserlessSam
 
 def _browserless_samples_page(**session_options: Any) -> BrowserlessSamplesPage:
     return BrowserlessSamplesPage(
+        session=BrowserlessWhoSampledSession(**session_options)
+    )
+
+
+def _browserless_sample_use_page(**session_options: Any) -> BrowserlessSampleUsePage:
+    return BrowserlessSampleUsePage(
         session=BrowserlessWhoSampledSession(**session_options)
     )
 
@@ -201,6 +208,423 @@ def test_openapi_describes_the_core_sample_use_route() -> None:
         "sampling_recording",
         "source_material",
     ]
+    assert set(operation["responses"]) == {"200", "404", "422", "502", "503", "504"}
+    assert operation["responses"]["404"]["content"]["application/json"]["example"] == {
+        "detail": {
+            "code": "sample_use_not_found",
+            "message": "Sample Use was not found.",
+        }
+    }
+    validation_or_unsupported = operation["responses"]["422"]["content"][
+        "application/json"
+    ]
+    assert validation_or_unsupported["schema"] == {
+        "oneOf": [
+            {"$ref": "#/components/schemas/ErrorResponse"},
+            {"$ref": "#/components/schemas/HTTPValidationError"},
+        ]
+    }
+    assert validation_or_unsupported["examples"]["unsupported_connection_type"]["value"] == {
+        "detail": {
+            "code": "unsupported_connection_type",
+            "message": "Only direct Sample Uses are supported.",
+        }
+    }
+    malformed_id_response = TestClient(app).get("/sample-uses/01")
+    assert validation_or_unsupported["examples"]["validation_error"]["value"] == (
+        malformed_id_response.json()
+    )
+    assert operation["responses"]["502"]["content"]["application/json"]["example"] == {
+        "detail": {
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        }
+    }
+    service_examples = operation["responses"]["503"]["content"]["application/json"][
+        "examples"
+    ]
+    assert set(service_examples) == {"clearance_failed", "upstream_rate_limited"}
+    assert operation["responses"]["504"]["content"]["application/json"]["example"] == {
+        "detail": {
+            "code": "lookup_timeout",
+            "message": "The lookup exceeded its 120-second time limit.",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "sample_use_id",
+    ["not-a-number", "0", "-1", "1.0", "+1", "01", "%201"],
+)
+def test_invalid_sample_use_id_is_rejected_before_upstream_work(
+    sample_use_id: str,
+) -> None:
+    fetches = 0
+
+    def fetch(requested_id: int) -> SampleUsePage:
+        nonlocal fetches
+        fetches += 1
+        raise AssertionError("upstream fetch must not run for an invalid Sample Use ID")
+
+    with _override_sample_use_page(fetch):
+        response = TestClient(app).get(f"/sample-uses/{sample_use_id}")
+
+    assert response.status_code == 422
+    assert fetches == 0
+
+
+def test_missing_sample_use_has_stable_not_found_response() -> None:
+    fetch_sample_use_page = _browserless_sample_use_page(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent=FIREFOX_135_USER_AGENT,
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=404,
+            text="not found",
+            resolved_url=url,
+        ),
+        monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_sample_use_page(fetch_sample_use_page):
+        response = TestClient(app, raise_server_exceptions=False).get("/sample-uses/211335")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "sample_use_not_found",
+            "message": "Sample Use was not found.",
+        }
+    }
+
+
+def test_interpolation_has_stable_unsupported_connection_response() -> None:
+    document = (FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8")
+    document = document.replace(
+        "Direct Sample of Multiple Elements",
+        "Interpolation of Multiple Elements",
+    )
+    page = SampleUsePage(
+        html=document,
+        resolved_url="https://www.whosampled.com/sample/211335/an-interpolation/",
+    )
+
+    with _override_sample_use_page(lambda sample_use_id: page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": "unsupported_connection_type",
+            "message": "Only direct Sample Uses are supported.",
+        }
+    }
+
+
+def test_other_non_direct_relationship_has_stable_unsupported_response() -> None:
+    document = (FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8")
+    document = document.replace(
+        "Direct Sample of Multiple Elements",
+        "Reused Through an Unsupported Relationship",
+    )
+    page = SampleUsePage(
+        html=document,
+        resolved_url="https://www.whosampled.com/sample/211335/an-unsupported-relationship/",
+    )
+
+    with _override_sample_use_page(lambda sample_use_id: page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "unsupported_connection_type",
+        "message": "Only direct Sample Uses are supported.",
+    }
+
+
+def test_non_direct_relationship_does_not_require_direct_sample_containers() -> None:
+    document = (FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8")
+    document = document.replace(
+        "Direct Sample of Multiple Elements",
+        "Interpolation of Multiple Elements",
+    )
+    document = document.replace("sampleWrap_dest", "interpolation_dest")
+    document = document.replace("sampleWrap_source", "interpolation_source")
+    page = SampleUsePage(
+        html=document,
+        resolved_url="https://www.whosampled.com/sample/211335/an-interpolation/",
+    )
+
+    with _override_sample_use_page(lambda sample_use_id: page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "unsupported_connection_type"
+
+
+@pytest.mark.parametrize(
+    "resolved_url",
+    [
+        "https://www.whosampled.com/sample/999999/a-different-sample-use/",
+        "https://example.com/sample/211335/a-sample-use/",
+        "http://www.whosampled.com/sample/211335/a-sample-use/",
+        "https://www.whosampled.com/Kanye-West/Bound-2/",
+        "https://www.whosampled.com/sample/211335/a-sample-use/#discussion",
+        "https://www.whosampled.com/sample/211335/a/sample/211335/",
+    ],
+)
+def test_invalid_sample_use_redirect_has_stable_bad_gateway_response(
+    resolved_url: str,
+) -> None:
+    fetch_sample_use_page = _browserless_sample_use_page(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent=FIREFOX_135_USER_AGENT,
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=lambda url, clearance, timeout: BrowserlessResponse(
+            status_code=200,
+            text=(FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8"),
+            resolved_url=resolved_url,
+        ),
+        monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_sample_use_page(fetch_sample_use_page):
+        response = TestClient(app, raise_server_exceptions=False).get("/sample-uses/211335")
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": {
+            "code": "upstream_invalid",
+            "message": "WhoSampled returned an unexpected response.",
+        }
+    }
+
+
+def test_contradictory_sample_use_structure_has_stable_bad_gateway_response() -> None:
+    document = (FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8")
+    document = document.replace(
+        '<h2 class="section-header-title">Direct Sample of Multiple Elements</h2>',
+        (
+            '<h2 class="section-header-title">Direct Sample of Multiple Elements</h2>'
+            '<h2 class="section-header-title">Interpolation of Multiple Elements</h2>'
+        ),
+    )
+    page = SampleUsePage(
+        html=document,
+        resolved_url="https://www.whosampled.com/sample/211335/a-sample-use/",
+    )
+
+    with _override_sample_use_page(lambda sample_use_id: page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_invalid"
+
+
+@pytest.mark.parametrize(
+    "canonical_markup",
+    [
+        "",
+        (
+            '<link rel="canonical" href="https://www.whosampled.com/sample/999999/'
+            'a-different-sample-use/">'
+        ),
+        (
+            '<link rel="canonical" href="https://www.whosampled.com/sample/not-an-id/'
+            'a-sample-use/">'
+        ),
+        (
+            '<link rel="canonical" href="https://www.whosampled.com/sample/211335/'
+            'a-sample-use/">'
+            '<link rel="canonical" href="https://www.whosampled.com/sample/211335/'
+            'a-duplicate/">'
+        ),
+    ],
+)
+def test_invalid_page_sample_use_identity_has_stable_bad_gateway_response(
+    canonical_markup: str,
+) -> None:
+    document = (FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8")
+    document = re.sub(r'<link rel="canonical"[^>]+>', canonical_markup, document)
+    page = SampleUsePage(
+        html=document,
+        resolved_url="https://www.whosampled.com/sample/211335/a-sample-use/",
+    )
+
+    with _override_sample_use_page(lambda sample_use_id: page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_invalid"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (ClearanceFailedError("clearance failed"), 503, "clearance_failed"),
+        (LookupTimeoutError("deadline exceeded"), 504, "lookup_timeout"),
+        (RuntimeError("temporary upstream failure"), 502, "upstream_invalid"),
+    ],
+)
+def test_sample_use_operational_failure_has_stable_response(
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    def fetch(sample_use_id: int) -> SampleUsePage:
+        raise error
+
+    with _override_sample_use_page(fetch):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"]["code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_retry_after"),
+    [
+        ("120", "120"),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("not valid", None),
+    ],
+)
+def test_sample_use_rate_limit_forwards_only_valid_retry_after(
+    retry_after: str,
+    expected_retry_after: str | None,
+) -> None:
+    fetches = 0
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        return BrowserlessResponse(
+            status_code=429,
+            text="rate limited",
+            resolved_url=url,
+            headers={"Retry-After": retry_after},
+        )
+
+    fetch_sample_use_page = _browserless_sample_use_page(
+        acquire_clearance=lambda timeout: ClearanceSession(
+            cookies={"cf_clearance": "secret"},
+            user_agent=FIREFOX_135_USER_AGENT,
+            expires_at=10_000.0,
+        ),
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_sample_use_page(fetch_sample_use_page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "upstream_rate_limited"
+    assert response.headers.get("retry-after") == expected_retry_after
+    assert fetches == 1
+
+
+@pytest.mark.parametrize("challenge_count", [1, 2])
+def test_sample_use_challenge_refreshes_clearance_at_most_once(
+    challenge_count: int,
+) -> None:
+    acquisitions = 0
+    fetches = 0
+
+    def acquire_clearance(timeout: float) -> ClearanceSession:
+        nonlocal acquisitions
+        acquisitions += 1
+        return ClearanceSession(
+            cookies={"cf_clearance": f"secret-{acquisitions}"},
+            user_agent=FIREFOX_135_USER_AGENT,
+            expires_at=10_000.0,
+        )
+
+    def fetch_browserlessly(
+        url: str, clearance: ClearanceSession, timeout: float
+    ) -> BrowserlessResponse:
+        nonlocal fetches
+        fetches += 1
+        if fetches <= challenge_count:
+            return BrowserlessResponse(
+                status_code=403,
+                text="<title>Just a moment...</title>",
+                resolved_url=url,
+            )
+        return BrowserlessResponse(
+            status_code=200,
+            text=(FIXTURES / "live_sample_use_detail.html").read_text(encoding="utf-8"),
+            resolved_url=url,
+        )
+
+    fetch_sample_use_page = _browserless_sample_use_page(
+        acquire_clearance=acquire_clearance,
+        fetch_browserlessly=fetch_browserlessly,
+        monotonic=lambda: 0.0,
+        sleep=lambda delay: None,
+        minimum_interval_seconds=0.0,
+        minimum_jitter_seconds=0.0,
+        maximum_jitter_seconds=0.0,
+    )
+
+    with _override_sample_use_page(fetch_sample_use_page):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == (200 if challenge_count == 1 else 503)
+    assert acquisitions == 2
+    assert fetches == 2
+    if challenge_count == 2:
+        assert response.json()["detail"]["code"] == "clearance_failed"
+
+
+def test_sample_use_logs_lifecycle_and_code_without_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_error = ValueError(
+        "<html>Authorization: bearer-secret cf_clearance=cookie-secret sample=211335</html>"
+    )
+
+    def fetch(sample_use_id: int) -> SampleUsePage:
+        raise sensitive_error
+
+    with caplog.at_level("INFO"), _override_sample_use_page(fetch):
+        response = TestClient(app).get("/sample-uses/211335")
+
+    assert response.status_code == 502
+    messages = "\n".join(
+        record.getMessage() for record in caplog.records if record.name == "uvicorn.error"
+    )
+    assert "Sample Use lookup started" in messages
+    assert "Sample Use lookup failed code=upstream_invalid" in messages
+    assert all(
+        secret not in messages.lower()
+        for secret in (
+            "211335",
+            "<html",
+            "authorization:",
+            "bearer-secret",
+            "cf_clearance",
+            "cookie-secret",
+        )
+    )
 
 
 def test_user_receives_one_sample_use_by_default() -> None:
@@ -1615,6 +2039,8 @@ def test_generated_docs_describe_the_samples_contract() -> None:
             "invalid_cursor",
             "collection_changed",
             "upstream_rate_limited",
+            "sample_use_not_found",
+            "unsupported_connection_type",
         ],
         "title": "Code",
     }
